@@ -473,6 +473,7 @@ class MPMEntity(ParticleEntity):
         F: ti.types.ndarray(),  # shape [B, n_particles, 3, 3]
         Jp: ti.types.ndarray(),  # shape [B, n_particles]
         active: ti.types.ndarray(),  # shape [B, n_particles]
+        von_mises: ti.types.ndarray(),  # shape [B, n_particles]
     ):
         """
         Extract the state of particles at the given frame.
@@ -493,6 +494,8 @@ class MPMEntity(ParticleEntity):
             Volume ratio, shape (B, n_particles).
         active : ndarray
             Particle activeness state, shape (B, n_particles).
+        von_mises : ndarray
+            Particle von mises stress, shape (B, n_particles).
         """
         for i_p, i_b in ti.ndrange(self.n_particles, self._sim._B):
             i_global = i_p + self._particle_start
@@ -507,6 +510,7 @@ class MPMEntity(ParticleEntity):
             # Copy Jp, active
             Jp[i_b, i_p] = self._solver.particles[f, i_global, i_b].Jp
             active[i_b, i_p] = self._solver.particles_ng[f, i_global, i_b].active
+            von_mises[i_b, i_p] = self._solver.particles[f, i_global, i_b].von_mises
 
     @ti.kernel
     def set_frame_add_grad_pos(self, f: ti.i32, pos_grad: ti.types.ndarray()):
@@ -663,6 +667,7 @@ class MPMEntity(ParticleEntity):
             F=state.F,
             Jp=state.Jp,
             active=state.active,
+            von_mises=state.von_mises,
         )
 
         # we store all queried states to track gradient flow

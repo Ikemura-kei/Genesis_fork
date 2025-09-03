@@ -57,6 +57,7 @@ class MPMEntityState(RBC):
         self._C = gs.zeros(base_shape + (3, 3), **args)
         self._F = gs.zeros(base_shape + (3, 3), **args)
         self._Jp = gs.zeros(base_shape, **args)
+        self._von_mises = gs.zeros(base_shape, **args)
 
         args["dtype"] = int
         args["requires_grad"] = False
@@ -103,6 +104,10 @@ class MPMEntityState(RBC):
     @property
     def active(self):
         return self._active
+    
+    @property
+    def von_mises(self):
+        return self._von_mises
 
 
 class SPHEntityState(RBC):

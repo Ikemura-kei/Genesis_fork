@@ -457,8 +457,13 @@ class RasterizerContext:
                     )
                     mesh.visual = mu.surface_uvs_to_trimesh_visual(mpm_entity.surface, n_verts=len(mesh.vertices))
 
-                    tfs = np.tile(np.eye(4), (mpm_entity.n_particles, 1, 1))
-                    tfs[:, :3, 3] = mpm_entity.init_particles
+                    tfs = np.tile(np.eye(4), (mpm_entity.n_particles * len(self.rendered_envs_idx), 1, 1))
+                    offset = 0
+
+                    for env_idx in self.rendered_envs_idx:
+                        tfs[offset:offset+mpm_entity.n_particles, :3, 3] = mpm_entity.init_particles
+                        offset += mpm_entity.n_particles
+                        
                     self.add_static_node(mpm_entity, pyrender.Mesh.from_trimesh(mesh, smooth=True, poses=tfs))
 
                 elif mpm_entity.surface.vis_mode == "visual":
@@ -504,8 +509,14 @@ class RasterizerContext:
                     self.add_dynamic_node(mpm_entity, pyrender.Mesh.from_trimesh(mesh, smooth=True))
 
                 elif mpm_entity.surface.vis_mode == "particle":
-                    tfs = np.tile(np.eye(4), (mpm_entity.n_particles, 1, 1))
-                    tfs[:, :3, 3] = particles_all[mpm_entity.particle_start : mpm_entity.particle_end]
+                    tfs = np.tile(np.eye(4), (mpm_entity.n_particles * len(self.rendered_envs_idx), 1, 1))
+                    offset = 0
+
+                    for env_idx in self.rendered_envs_idx:
+                        tfs[mpm_entity.particle_start+offset:mpm_entity.particle_end+offset, :3, 3] = self.sim.mpm_solver.particles_render.pos.to_numpy()[:, env_idx][mpm_entity.particle_start : mpm_entity.particle_end]
+                        offset += mpm_entity.particle_end
+
+                    # print(idx, particles_all.shape, particles_all, mpm_entity.particle_start, mpm_entity.particle_end)
 
                     node = self._scene.get_buffer_id(self.static_nodes[mpm_entity.uid], "model")
                     buffer_updates[node] = tfs.transpose((0, 2, 1))
