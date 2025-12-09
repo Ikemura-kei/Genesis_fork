@@ -1,16 +1,16 @@
 from typing import TYPE_CHECKING
 
-import gstaichi as ti
 import numpy as np
 import torch
-from numpy.typing import ArrayLike
+import trimesh
 
 import genesis as gs
-import trimesh
 from genesis.repr_base import RBC
 from genesis.utils import geom as gu
 
-from .rigid_geom import RigidGeom, RigidVisGeom
+from genesis.utils.misc import DeprecationError, tensor_to_array
+
+from .rigid_geom import RigidGeom, RigidVisGeom, _kernel_get_free_verts, _kernel_get_fixed_verts
 
 if TYPE_CHECKING:
     from .rigid_entity import RigidEntity
@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from genesis.ext.pyrender.interaction.vec3 import Pose
 
 
-@ti.data_oriented
 class RigidLink(RBC):
     """
     RigidLink class. One RigidEntity consists of multiple RigidLinks, each of which is a rigid body and could consist of multiple RigidGeoms (`link.geoms`, for collision) and RigidVisGeoms (`link.vgeoms` for visualization).
@@ -36,15 +35,16 @@ class RigidLink(RBC):
         vert_start: int,
         face_start: int,
         edge_start: int,
-        verts_state_start: int,
+        free_verts_state_start: int,
+        fixed_verts_state_start: int,
         vgeom_start: int,
         vvert_start: int,
         vface_start: int,
-        pos: ArrayLike,
-        quat: ArrayLike,
-        inertial_pos: ArrayLike | None,
-        inertial_quat: ArrayLike | None,
-        inertial_i: ArrayLike | None,  # may be None, eg. for plane; NDArray is 3x3 matrix
+        pos: "np.typing.ArrayLike",
+        quat: "np.typing.ArrayLike",
+        inertial_pos: "np.typing.ArrayLike | None",
+        inertial_quat: "np.typing.ArrayLike | None",
+        inertial_i: "np.typing.ArrayLike | None",  # may be None, eg. for plane; NDArray is 3x3 matrix
         inertial_mass: float | None,  # may be None, eg. for plane
         parent_idx: int,
         root_idx: int | None,
@@ -59,9 +59,28 @@ class RigidLink(RBC):
         self._uid = gs.UID()
         self._idx: int = idx
         self._parent_idx: int = parent_idx  # -1 if no parent
-        self._root_idx: int | None = root_idx  # None if no root
         self._child_idxs: list[int] = list()
-        self._invweight: float | None = invweight
+
+        # 'is_fixed' attribute specifies whether the link is free to move.
+        # In practice, this attributes determines whether the geometry vertices associated with the entity are stored
+        # per batch-element and updated at every simulation step, or computed once at build time and shared among the
+        # entire batch. This affects correct processing of collision detection and sensor raycasting as a side-effect.
+        is_fixed = True
+        link = self
+        while True:
+            is_fixed &= all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints)
+            if link.parent_idx == -1:
+                break
+            link = self.entity.links[link.parent_idx - self.entity.link_start]
+        if root_idx is None:
+            root_idx = link.idx
+        self._root_idx: int = root_idx
+        self._is_fixed: bool = is_fixed
+
+        if is_fixed and not entity._batch_fixed_verts:
+            verts_state_start = fixed_verts_state_start
+        else:
+            verts_state_start = free_verts_state_start
 
         self._joint_start: int = joint_start
         self._n_joints: int = n_joints
@@ -77,17 +96,18 @@ class RigidLink(RBC):
         self._vface_start: int = vface_start
 
         # Link position & rotation at creation time:
-        self._pos: ArrayLike = pos
-        self._quat: ArrayLike = quat
+        self._pos: "np.typing.ArrayLike" = pos
+        self._quat: "np.typing.ArrayLike" = quat
         # Link's center-of-mass position & principal axes frame rotation at creation time:
         if inertial_pos is not None:
             inertial_pos = np.asarray(inertial_pos, dtype=gs.np_float)
-        self._inertial_pos: ArrayLike | None = inertial_pos
+        self._inertial_pos: "np.typing.ArrayLike | None" = inertial_pos
         if inertial_quat is not None:
             inertial_quat = np.asarray(inertial_quat, dtype=gs.np_float)
-        self._inertial_quat: ArrayLike | None = inertial_quat
+        self._inertial_quat: "np.typing.ArrayLike | None" = inertial_quat
         self._inertial_mass: float | None = inertial_mass
-        self._inertial_i: ArrayLike | None = inertial_i
+        self._inertial_i: "np.typing.ArrayLike | None" = inertial_i
+        self._invweight: float | None = invweight
 
         self._visualize_contact = visualize_contact
 
@@ -102,18 +122,6 @@ class RigidLink(RBC):
             vgeom._build()
 
         self._init_mesh = self._compose_init_mesh()
-
-        # find root link and check if link is fixed
-        solver_links = self._solver.links
-        link = self
-        is_fixed = all(joint.type is gs.JOINT_TYPE.FIXED for joint in self.joints)
-        while link.parent_idx > -1:
-            link = solver_links[link.parent_idx]
-            if not all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints):
-                is_fixed = False
-        if self._root_idx is None:
-            self._root_idx = gs.np_int(link.idx)
-        self.is_fixed = is_fixed
 
         # inertial_mass and inertia_i
         if self._inertial_mass is None:
@@ -166,12 +174,8 @@ class RigidLink(RBC):
         self._inertial_i = np.asarray(self._inertial_i, dtype=gs.np_float)
 
         # override invweight if fixed
-        if is_fixed:
+        if self._is_fixed:
             self._invweight = np.zeros((2,), dtype=gs.np_float)
-
-        import genesis.engine.solvers.rigid.rigid_solver_decomp as rigid_solver_decomp
-
-        self.rsd = rigid_solver_decomp
 
     def _compose_init_mesh(self):
         if len(self._geoms) == 0 and len(self._vgeoms) == 0:
@@ -256,7 +260,7 @@ class RigidLink(RBC):
         envs_idx : int or array of int, optional
             The indices of the environments to get the position. If None, get the position of all environments. Default is None.
         """
-        return self._solver.get_links_pos([self._idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_pos(self._idx, envs_idx)[..., 0, :]
 
     @gs.assert_built
     def get_quat(self, envs_idx=None):
@@ -268,7 +272,7 @@ class RigidLink(RBC):
         envs_idx : int or array of int, optional
             The indices of the environments to get the quaternion. If None, get the quaternion of all environments. Default is None.
         """
-        return self._solver.get_links_quat([self._idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_quat(self._idx, envs_idx)[..., 0, :]
 
     @gs.assert_built
     def get_vel(self, envs_idx=None) -> torch.Tensor:
@@ -280,7 +284,7 @@ class RigidLink(RBC):
         envs_idx : int or array of int, optional
             The indices of the environments to get the linear velocity. If None, get the linear velocity of all environments. Default is None.
         """
-        return self._solver.get_links_vel([self._idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_vel(self._idx, envs_idx)[..., 0, :]
 
     @gs.assert_built
     def get_ang(self, envs_idx=None) -> torch.Tensor:
@@ -292,99 +296,43 @@ class RigidLink(RBC):
         envs_idx : int or array of int, optional
             The indices of the environments to get the angular velocity. If None, get the angular velocity of all environments. Default is None.
         """
-        return self._solver.get_links_ang([self._idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_ang(self._idx, envs_idx)[..., 0, :]
 
     @gs.assert_built
     def get_verts(self):
         """
         Get the vertices of the link's collision body (concatenation of all `link.geoms`) in the world frame.
         """
-        self._update_verts_for_geom()
-        if self.is_free:
-            tensor = torch.empty(
-                self._solver._batch_shape((self.n_verts, 3), True), dtype=gs.tc_float, device=gs.device
-            )
-            self._kernel_get_free_verts(tensor)
-            if self._solver.n_envs == 0:
-                tensor = tensor.squeeze(0)
-        else:
+        self._solver.update_verts_for_geoms(slice(self.geom_start, self.geom_end))
+
+        if self.is_fixed and not self._entity._batch_fixed_verts:
             tensor = torch.empty((self.n_verts, 3), dtype=gs.tc_float, device=gs.device)
-            self._kernel_get_fixed_verts(tensor)
+            _kernel_get_fixed_verts(tensor, self._verts_state_start, self.n_verts, self._solver.fixed_verts_state)
+        else:
+            tensor = torch.empty((self._solver._B, self.n_verts, 3), dtype=gs.tc_float, device=gs.device)
+            _kernel_get_free_verts(tensor, self._verts_state_start, self.n_verts, self._solver.free_verts_state)
+            if self._solver.n_envs == 0:
+                tensor = tensor[0]
         return tensor
-
-    @gs.assert_built
-    def _update_verts_for_geom(self):
-        for i_g_ in range(self.n_geoms):
-            i_g = i_g_ + self._geom_start
-            self._solver.update_verts_for_geom(i_g)
-
-    @ti.kernel
-    def _kernel_get_free_verts(self, tensor: ti.types.ndarray()):
-        for i, j, b in ti.ndrange(self.n_verts, 3, self._solver._B):
-            idx_vert = i + self._verts_state_start
-            tensor[b, i, j] = self._solver.free_verts_state.pos[idx_vert, b][j]
-
-    @ti.kernel
-    def _kernel_get_fixed_verts(self, tensor: ti.types.ndarray()):
-        for i, j in ti.ndrange(self.n_verts, 3):
-            idx_vert = i + self._verts_state_start
-            tensor[i, j] = self._solver.fixed_verts_state.pos[idx_vert][j]
-
-    @gs.assert_built
-    def get_vverts(self):
-        """
-        Get the vertices of the link's visualization body (concatenation of all `link.vgeoms`) in the world frame.
-        """
-        tensor = torch.empty(self._solver._batch_shape((self.n_vverts, 3), True), dtype=gs.tc_float, device=gs.device)
-        self._kernel_get_vverts(tensor)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
-        return tensor
-
-    @ti.kernel
-    def _kernel_get_vverts(self, tensor: ti.types.ndarray()):
-        for i_vg_, i_b in ti.ndrange(self.n_vgeoms, self._solver._B):
-            i_vg = i_vg_ + self._vgeom_start
-            for i_v in range(self._solver.vgeoms_info.vvert_start[i_vg], self._solver.vgeoms_info.vvert_end[i_vg]):
-                vvert_pos = gu.ti_transform_by_trans_quat(
-                    self._solver.vverts_info.init_pos[i_v],
-                    self._solver.vgeoms_state.pos[i_vg, i_b],
-                    self._solver.vgeoms_state.quat[i_vg, i_b],
-                )
-                for j in range(3):
-                    tensor[i_b, i_v - self._vvert_start, j] = vvert_pos[j]
 
     @gs.assert_built
     def get_AABB(self):
         """
-        Get the axis-aligned bounding box (AABB) of the link's collision body (concatenation of all `link.geoms`) in the world frame.
+        Get the axis-aligned bounding box (AABB) of the link's collision body in the world frame by aggregating all
+        the collision geometries associated with this link (`link.geoms`).
         """
         verts = self.get_verts()
-        AABB = torch.concatenate(
-            [verts.min(axis=-2, keepdim=True)[0], verts.max(axis=-2, keepdim=True)[0]],
-            axis=-2,
-        )
-        return AABB
-
-    @gs.assert_built
-    def get_vAABB(self):
-        """
-        Get the axis-aligned bounding box (AABB) of the link's visual body (concatenation of all `link.vgeoms`) in the world frame.
-        """
-        vverts = self.get_vverts()
-        AABB = torch.concatenate(
-            [vverts.min(axis=-2, keepdim=True)[0], vverts.max(axis=-2, keepdim=True)[0]],
-            axis=-2,
-        )
-        return AABB
+        return torch.stack((verts.min(axis=-2).values, verts.max(axis=-2).values), axis=-2)
 
     @gs.assert_built
     def set_mass(self, mass):
         """
         Set the mass of the link.
         """
+        from genesis.engine.solvers.rigid.rigid_solver_decomp import kernel_adjust_link_inertia
+
         if self.is_fixed:
-            gs.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
+            gs.logger.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
             return
 
         if mass < gs.EPS:
@@ -396,12 +344,11 @@ class RigidLink(RBC):
             self._invweight /= ratio
         self._inertial_i *= ratio
 
-        self.rsd.kernel_adjust_link_inertia(
+        kernel_adjust_link_inertia(
             link_idx=self.idx,
             ratio=ratio,
             links_info=self._solver.links_info,
             static_rigid_sim_config=self._solver._static_rigid_sim_config,
-            static_rigid_sim_cache_key=self._solver._static_rigid_sim_cache_key,
         )
 
     @gs.assert_built
@@ -462,7 +409,7 @@ class RigidLink(RBC):
         """
         The sequence of joints that connects the link to its parent link.
         """
-        return self._solver.joints[self.joint_start : self.joint_end]
+        return self.entity.joints_by_links[self.idx_local]
 
     @property
     def n_joints(self):
@@ -493,14 +440,14 @@ class RigidLink(RBC):
     @property
     def dof_start(self):
         """The index of the link's first degree of freedom (DOF) in the scene."""
-        if len(self.joints) == 0:
+        if not self.joints:
             return -1
         return self.joints[0].dof_start
 
     @property
     def dof_end(self):
         """The index of the link's last degree of freedom (DOF) in the scene *plus one*."""
-        if len(self.joints) == 0:
+        if not self.joints:
             return -1
         return self.joints[-1].dof_end
 
@@ -512,14 +459,14 @@ class RigidLink(RBC):
     @property
     def q_start(self):
         """Returns the starting index of the `q` variables of the link in the rigid solver."""
-        if len(self.joints) == 0:
+        if not self.joints:
             return -1
         return self.joints[0].q_start
 
     @property
     def q_end(self):
         """Returns the last index of the `q` variables of the link in the rigid solver *plus one*."""
-        if len(self.joints) == 0:
+        if not self.joints:
             return -1
         return self.joints[-1].q_end
 
@@ -584,37 +531,44 @@ class RigidLink(RBC):
         return len(self._child_idxs) == 0
 
     @property
+    def is_fixed(self):
+        """
+        Whether the link is fixed wrt the world.
+        """
+        return self._is_fixed
+
+    @property
     def invweight(self):
         """
         The invweight of the link.
         """
         if self._invweight is None:
-            self._invweight = self._solver.get_links_invweight([self._idx]).cpu().numpy()[..., 0, :]
+            self._invweight = tensor_to_array(self._solver.get_links_invweight(self._idx))[..., 0, :]
         return self._invweight
 
     @property
-    def pos(self) -> ArrayLike:
+    def pos(self) -> "np.typing.ArrayLike":
         """
         The initial position of the link. For real-time position, use `link.get_pos()`.
         """
         return self._pos
 
     @property
-    def quat(self) -> ArrayLike:
+    def quat(self) -> "np.typing.ArrayLike":
         """
         The initial quaternion of the link. For real-time quaternion, use `link.get_quat()`.
         """
         return self._quat
 
     @property
-    def inertial_pos(self) -> ArrayLike | None:
+    def inertial_pos(self) -> "np.typing.ArrayLike | None":
         """
         The initial position of the link's inertial frame.
         """
         return self._inertial_pos
 
     @property
-    def inertial_quat(self) -> ArrayLike | None:
+    def inertial_quat(self) -> "np.typing.ArrayLike | None":
         """
         The initial quaternion of the link's inertial frame.
         """
@@ -628,7 +582,7 @@ class RigidLink(RBC):
         return self._inertial_mass
 
     @property
-    def inertial_i(self) -> ArrayLike | None:
+    def inertial_i(self) -> "np.typing.ArrayLike | None":
         """
         The inerial matrix of the link.
         """
@@ -741,10 +695,7 @@ class RigidLink(RBC):
 
     @property
     def is_free(self):
-        """
-        Whether the entity the link belongs to is free.
-        """
-        return self.entity.is_free
+        raise DeprecationError("This property has been removed.")
 
     @property
     def pose(self) -> "Pose":

@@ -3,11 +3,11 @@ import numpy as np
 import gstaichi as ti
 
 import genesis as gs
-from genesis.engine.entities.base_entity import Entity
 from genesis.options.morphs import Morph
 from genesis.options.solvers import (
     AvatarOptions,
     BaseCouplerOptions,
+    IPCCouplerOptions,
     LegacyCouplerOptions,
     SAPCouplerOptions,
     FEMOptions,
@@ -22,7 +22,6 @@ from genesis.options.solvers import (
 from genesis.repr_base import RBC
 
 from .entities import HybridEntity
-from .solvers.base_solver import Solver
 from .solvers import (
     AvatarSolver,
     FEMSolver,
@@ -33,13 +32,19 @@ from .solvers import (
     SPHSolver,
     ToolSolver,
 )
-from .couplers import LegacyCoupler, SAPCoupler
+from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .states.cache import QueriedStates
 from .states.solvers import SimState
-from genesis.sensors.sensor_manager import SensorManager
+from .sensors import SensorManager
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
+    from genesis.engine.entities.base_entity import Entity
+
+    from .solvers.base_solver import Solver
+
+
+RATE_CHECK_ERRNO = 10
 
 
 @ti.data_oriented
@@ -121,7 +126,7 @@ class Simulator(RBC):
         self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
         self.sf_solver = SFSolver(self.scene, self, self.sf_options)
 
-        self._solvers: list[Solver] = gs.List(
+        self._solvers: list["Solver"] = gs.List(
             [
                 self.tool_solver,
                 self.rigid_solver,
@@ -134,23 +139,25 @@ class Simulator(RBC):
             ]
         )
 
-        self._active_solvers: list[Solver] = gs.List()
+        self._active_solvers: list["Solver"] = gs.List()
 
         # coupler
         if isinstance(self.coupler_options, SAPCouplerOptions):
             self._coupler = SAPCoupler(self, self.coupler_options)
         elif isinstance(self.coupler_options, LegacyCouplerOptions):
             self._coupler = LegacyCoupler(self, self.coupler_options)
+        elif isinstance(self.coupler_options, IPCCouplerOptions):
+            self._coupler = IPCCoupler(self, self.coupler_options)
         else:
             gs.raise_exception(
-                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions or LegacyCouplerOptions."
+                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions, LegacyCouplerOptions, or IPCCouplerOptions."
             )
 
         # states
         self._queried_states = QueriedStates()
 
         # entities
-        self._entities: list[Entity] = gs.List()
+        self._entities: list["Entity"] = gs.List()
 
         # sensors
         self._sensor_manager = SensorManager(self)
@@ -158,30 +165,21 @@ class Simulator(RBC):
     def _add_entity(self, morph: Morph, material, surface, visualize_contact=False):
         if isinstance(material, gs.materials.Tool):
             entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface)
-
         elif isinstance(material, gs.materials.Avatar):
             entity = self.avatar_solver.add_entity(self.n_entities, material, morph, surface, visualize_contact)
-
         elif isinstance(material, gs.materials.Rigid):
             entity = self.rigid_solver.add_entity(self.n_entities, material, morph, surface, visualize_contact)
-
         elif isinstance(material, gs.materials.MPM.Base):
             entity = self.mpm_solver.add_entity(self.n_entities, material, morph, surface)
-
         elif isinstance(material, gs.materials.SPH.Base):
             entity = self.sph_solver.add_entity(self.n_entities, material, morph, surface)
-
         elif isinstance(material, gs.materials.PBD.Base):
             entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface)
-
         elif isinstance(material, gs.materials.FEM.Base):
             entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface)
-
         elif isinstance(material, gs.materials.Hybrid):
-            entity = HybridEntity(
-                self.n_entities, self.scene, material, morph, surface
-            )  # adding to solver is handled in the hybrid entity
-
+            # Note that adding to solver is handled in the hybrid entity
+            entity = HybridEntity(self.n_entities, self.scene, material, morph, surface)
         else:
             gs.raise_exception(f"Material not supported.: {material}")
 
@@ -198,35 +196,39 @@ class Simulator(RBC):
         self._para_level = self.scene._para_level
 
         # solvers
-        self._rigid_only = self.rigid_solver.is_active()
+        # IPCCoupler needs full substep flow for pre/post coupling phases
+        self._rigid_only = self.rigid_solver.is_active and not isinstance(self._coupler, (SAPCoupler, IPCCoupler))
         for solver in self._solvers:
             solver.build()
-            if solver.is_active():
+            if solver.is_active:
                 self._active_solvers.append(solver)
                 if not isinstance(solver, RigidSolver):
                     self._rigid_only = False
         self._coupler.build()
 
-        if self.n_envs > 0 and self.sf_solver.is_active():
+        if self.n_envs > 0 and self.sf_solver.is_active:
             gs.raise_exception("Batching is not supported for SF solver as of now.")
-
-        self._sensor_manager.build()
 
         # hybrid
         for entity in self._entities:
             if isinstance(entity, HybridEntity):
                 entity.build()
 
+        self._sensor_manager.build()
+
     def reset(self, state: SimState, envs_idx=None):
         for solver, solver_state in zip(self._solvers, state):
             if solver.n_entities > 0:
                 solver.set_state(0, solver_state, envs_idx)
 
-        self.coupler.reset(envs_idx=envs_idx)
+        self._coupler.reset(envs_idx=envs_idx)
 
         # TODO: keeping as is for now
         self.reset_grad()
         self._cur_substep_global = 0
+
+        # reset sensors state
+        self._sensor_manager.reset(envs_idx=envs_idx)
 
     def reset_grad(self):
         for solver in self._active_solvers:
@@ -264,11 +266,17 @@ class Simulator(RBC):
     # ------------------------------------------------------------------------------------
 
     def step(self, in_backward=False):
-        if self._rigid_only:  # "Only Advance!" --Thomas Wade :P
-            for _ in range(self._substeps):
-                self.rigid_solver.substep()
-                self._cur_substep_global += 1
+        # Check errno at the very beginning of the step.
+        # This will trigger GPU sync, but it is not a big deal at the point, since we are going to enqueue very large
+        # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
+        # continue growing endlessly, which will not make the simulation faster either.
+        if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
+            self.rigid_solver.check_errno()
 
+        if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
+            for _ in range(self._substeps):
+                self.rigid_solver.substep(self.cur_substep_local)
+                self._cur_substep_global += 1
         else:
             self.process_input(in_backward=in_backward)
             for _ in range(self._substeps):
@@ -278,7 +286,7 @@ class Simulator(RBC):
                 if self.cur_substep_local == 0 and not in_backward:
                     self.save_ckpt()
 
-        if self.rigid_solver.is_active():
+        if self.rigid_solver.is_active:
             self.rigid_solver.clear_external_force()
 
         self._sensor_manager.step()
@@ -411,7 +419,7 @@ class Simulator(RBC):
 
     def set_gravity(self, gravity, envs_idx=None):
         for solver in self._solvers:
-            if solver.is_active():
+            if solver.is_active:
                 solver.set_gravity(gravity, envs_idx)
 
     # ------------------------------------------------------------------------------------

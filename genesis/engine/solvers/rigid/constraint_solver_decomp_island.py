@@ -32,77 +32,71 @@ class ConstraintSolverIsland:
         self.sparse_solve: bool = True
 
         # 4 constraints per contact and 1 constraints per joint limit (upper and lower, if not inf)
-        self.len_constraints = (
-            5 * self._collider._collider_info._max_contact_pairs[None]
+        self.len_constraints = int(
+            4 * self._collider._collider_info.max_contact_pairs[None]
             + np.logical_not(np.isinf(self._solver.dofs_info.limit.to_numpy()[:, 0])).sum()
         )
         self.len_constraints_ = max(1, self.len_constraints)
 
         self.constraint_state = array_class.get_constraint_state(self, self._solver)
 
-        self.jac = ti.field(
-            dtype=gs.ti_float, shape=self._solver._batch_shape((self.len_constraints_, self._solver.n_dofs_))
-        )
-        self.diag = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
-        self.aref = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
+        self.jac = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._solver.n_dofs_, self._B))
+        self.diag = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
+        self.aref = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
 
         if self.sparse_solve:
-            self.jac_relevant_dofs = ti.field(
-                gs.ti_int, shape=self._solver._batch_shape((self.len_constraints_, self._solver.n_dofs_))
-            )
-            self.jac_n_relevant_dofs = ti.field(gs.ti_int, shape=self._solver._batch_shape(self.len_constraints_))
+            self.jac_relevant_dofs = ti.field(gs.ti_int, shape=(self.len_constraints_, self._solver.n_dofs_, self._B))
+            self.jac_n_relevant_dofs = ti.field(gs.ti_int, shape=(self.len_constraints_, self._B))
 
-        self.n_constraints = ti.field(gs.ti_int, shape=self._solver._batch_shape())
-        self.improved = ti.field(gs.ti_int, shape=self._solver._batch_shape())
+        self.n_constraints = ti.field(gs.ti_int, shape=(self._B,))
+        self.improved = ti.field(gs.ti_bool, shape=(self._B,))
 
-        self.Jaref = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
-        self.Ma = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.Ma_ws = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.grad = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.Mgrad = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.search = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
+        self.Jaref = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
+        self.Ma = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.Ma_ws = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.grad = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.Mgrad = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.search = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
 
-        self.efc_D = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
-        self.efc_force = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
-        self.active = ti.field(dtype=gs.ti_int, shape=self._solver._batch_shape(self.len_constraints_))
-        self.prev_active = ti.field(dtype=gs.ti_int, shape=self._solver._batch_shape(self.len_constraints_))
-        self.qfrc_constraint = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.qacc = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.qacc_ws = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.qacc_prev = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
+        self.efc_D = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
+        self.efc_force = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
+        self.active = ti.field(dtype=gs.ti_bool, shape=(self.len_constraints_, self._B))
+        self.prev_active = ti.field(dtype=gs.ti_bool, shape=(self.len_constraints_, self._B))
+        self.qfrc_constraint = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.qacc = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.qacc_ws = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.qacc_prev = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
 
-        self.cost_ws = ti.field(gs.ti_float, shape=self._solver._batch_shape())
+        self.cost_ws = ti.field(gs.ti_float, shape=(self._B,))
 
-        self.gauss = ti.field(gs.ti_float, shape=self._solver._batch_shape())
-        self.cost = ti.field(gs.ti_float, shape=self._solver._batch_shape())
-        self.prev_cost = ti.field(gs.ti_float, shape=self._solver._batch_shape())
+        self.gauss = ti.field(gs.ti_float, shape=(self._B,))
+        self.cost = ti.field(gs.ti_float, shape=(self._B,))
+        self.prev_cost = ti.field(gs.ti_float, shape=(self._B,))
 
         ## line search
-        self.gtol = ti.field(gs.ti_float, shape=self._solver._batch_shape())
+        self.gtol = ti.field(gs.ti_float, shape=(self._B,))
 
-        self.mv = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-        self.jv = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.len_constraints_))
-        self.quad_gauss = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(3))
-        self.quad = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape((self.len_constraints_, 3)))
+        self.mv = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+        self.jv = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
+        self.quad_gauss = ti.field(dtype=gs.ti_float, shape=(3, self._B))
+        self.quad = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, 3, self._B))
 
-        self.candidates = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(12))
-        self.ls_its = ti.field(gs.ti_float, shape=self._solver._batch_shape())
-        self.ls_result = ti.field(gs.ti_int, shape=self._solver._batch_shape())
+        self.candidates = ti.field(dtype=gs.ti_float, shape=(12, self._B))
+        self.ls_it = ti.field(gs.ti_float, shape=(self._B,))
+        self.ls_result = ti.field(gs.ti_int, shape=(self._B,))
 
         self.contact_island = ContactIsland(self._collider)
         self.entities_info = self._solver.entities_info
 
         if self._solver_type == gs.constraint_solver.CG:
-            self.cg_prev_grad = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-            self.cg_prev_Mgrad = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
-            self.cg_beta = ti.field(gs.ti_float, shape=self._solver._batch_shape())
-            self.cg_pg_dot_pMg = ti.field(gs.ti_float, shape=self._solver._batch_shape())
+            self.cg_prev_grad = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+            self.cg_prev_Mgrad = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
+            self.cg_beta = ti.field(gs.ti_float, shape=(self._B,))
+            self.cg_pg_dot_pMg = ti.field(gs.ti_float, shape=(self._B,))
 
         if self._solver_type == gs.constraint_solver.Newton:
-            self.nt_H = ti.field(
-                dtype=gs.ti_float, shape=self._solver._batch_shape((self._solver.n_dofs_, self._solver.n_dofs_))
-            )
-            self.nt_vec = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self._solver.n_dofs_))
+            self.nt_H = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._solver.n_dofs_, self._B))
+            self.nt_vec = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
 
         self.reset()
 
@@ -522,18 +516,6 @@ class ConstraintSolverIsland:
                 for i_c in range(self.len_constraints_):
                     self.jac_n_relevant_dofs[i_c, i_b] = 0
 
-    # def resolve(self):
-    #     from genesis.utils.tools import create_timer
-    #     timer = create_timer(name='resolve', level=3, ti_sync=True, skip_first_call=True)
-    #     self._func_init_solver()
-    #     timer.stamp('_func_init_solver')
-    #     self._func_solve()
-    #     timer.stamp('_func_solve')
-    #     self._func_update_qacc()
-    #     timer.stamp('_func_update_qacc')
-    #     self._func_update_contact_force()
-    #     timer.stamp('compute force')
-
     @ti.func
     def _func_update_contact_force(self, i_island: int, i_b: int):
         for i_island_entity in range(self.contact_island.island_entity[i_island, i_b].n):
@@ -584,7 +566,7 @@ class ConstraintSolverIsland:
             tol_scaled = (self._solver.meaninertia[i_b] * ti.max(1, self._solver.n_dofs)) * self.tolerance
             for it in range(self.iterations):
                 self._func_solve_body(i_island, i_b)
-                if self.improved[i_b] < 1:
+                if not self.improved[i_b]:
                     break
 
                 gradient = gs.ti_float(0.0)
@@ -669,13 +651,12 @@ class ConstraintSolverIsland:
         deriv_0 = 2 * alpha * tmp_quad_total2 + tmp_quad_total1
         deriv_1 = 2 * tmp_quad_total2 + gs.EPS * (ti.abs(tmp_quad_total2) < gs.EPS)
 
-        self.ls_its[i_b] = self.ls_its[i_b] + 1
+        self.ls_it[i_b] = self.ls_it[i_b] + 1
 
         return alpha, cost, deriv_0, deriv_1
 
     @ti.func
     def _func_linesearch(self, island, i_b):
-
         ## use adaptive linesearch tolerance
         snorm = gs.ti_float(0.0)
         for i_island_entity in range(self.contact_island.island_entity[island, i_b].n):
@@ -688,7 +669,7 @@ class ConstraintSolverIsland:
         gtol = self.tolerance * self.ls_tolerance * snorm
         ## use adaptive linesearch tolerance
 
-        self.ls_its[i_b] = 0
+        self.ls_it[i_b] = 0
         self.ls_result[i_b] = 0
         ls_slope = gs.ti_float(1.0)
 
@@ -721,7 +702,7 @@ class ConstraintSolverIsland:
                 direction = (p1_deriv_0 < 0) * 2 - 1
                 p2update = 0
                 p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1 = p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1
-                while p1_deriv_0 * direction <= -gtol and self.ls_its[i_b] < self.ls_iterations:
+                while p1_deriv_0 * direction <= -gtol and self.ls_it[i_b] < self.ls_iterations:
                     p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1 = p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1
                     p2update = 1
 
@@ -735,7 +716,7 @@ class ConstraintSolverIsland:
                         break
                 if not done:
 
-                    if self.ls_its[i_b] >= self.ls_iterations:
+                    if self.ls_it[i_b] >= self.ls_iterations:
                         self.ls_result[i_b] = 3
                         ls_slope = ti.abs(p1_deriv_0) * slopescl
                         res_alpha = p1_alpha
@@ -748,7 +729,6 @@ class ConstraintSolverIsland:
                         done = True
 
                     if not done:
-
                         p2_next_alpha, p2_next_cost, p2_next_deriv_0, p2_next_deriv_1 = (
                             p1_alpha,
                             p1_cost,
@@ -760,8 +740,7 @@ class ConstraintSolverIsland:
                             i_b, p1_alpha - p1_deriv_0 / p1_deriv_1
                         )
 
-                        while self.ls_its[i_b] < self.ls_iterations:
-
+                        while self.ls_it[i_b] < self.ls_iterations:
                             pmid_alpha, pmid_cost, pmid_deriv_0, pmid_deriv_1 = self._func_ls_point_fn(
                                 i_b, (p1_alpha + p2_alpha) * 0.5
                             )
@@ -865,7 +844,6 @@ class ConstraintSolverIsland:
                 )
 
                 flag = 1
-
             elif p_deriv_0 > 0 and self.candidates[4 * i + 2, i_b] > 0 and p_deriv_0 > self.candidates[4 * i + 2, i_b]:
                 p_alpha, p_cost, p_deriv_0, p_deriv_1 = (
                     self.candidates[4 * i + 0, i_b],
@@ -890,9 +868,9 @@ class ConstraintSolverIsland:
         alpha = self._func_linesearch(island, i_b)
 
         if ti.abs(alpha) < gs.EPS:
-            self.improved[i_b] = 0
+            self.improved[i_b] = False
         else:
-            self.improved[i_b] = 1
+            self.improved[i_b] = True
             for i_island_entity in range(self.contact_island.island_entity[island, i_b].n):
                 i_e_ = self.contact_island.island_entity[island, i_b].start + i_island_entity
                 i_e = self.contact_island.entity_id[i_e_, i_b]
@@ -904,7 +882,6 @@ class ConstraintSolverIsland:
                 self.Jaref[i_c, i_b] = self.Jaref[i_c, i_b] + self.jv[i_c, i_b] * alpha
 
             if ti.static(self._solver_type == gs.constraint_solver.CG):
-
                 for i_island_entity in range(self.contact_island.island_entity[island, i_b].n):
                     i_e_ = self.contact_island.island_entity[island, i_b].start + i_island_entity
                     i_e = self.contact_island.entity_id[i_e_, i_b]
@@ -934,7 +911,6 @@ class ConstraintSolverIsland:
                     i_e = self.contact_island.entity_id[i_e_, i_b]
                     for i_d in range(self.entities_info.dof_start[i_e], self.entities_info.dof_end[i_e]):
                         self.search[i_d, i_b] = -self.Mgrad[i_d, i_b] + self.cg_beta[i_b] * self.search[i_d, i_b]
-
             elif ti.static(self._solver_type == gs.constraint_solver.Newton):
                 improvement = self.prev_cost[i_b] - self.cost[i_b]
                 if improvement > 0:
@@ -1009,15 +985,14 @@ class ConstraintSolverIsland:
 
         if ti.static(self._solver_type == gs.constraint_solver.CG):
             for i_e in range(self._solver.n_entities):
-                self._solver._mass_mat_mask[i_e, i_b] = 0
+                self._solver.mass_mat_mask[i_e, i_b] = False
             for i_island_entity in range(self.contact_island.island_entity[island, i_b].n):
                 i_e_ = self.contact_island.island_entity[island, i_b].start + i_island_entity
                 i_e = self.contact_island.entity_id[i_e_, i_b]
-                self._solver._mass_mat_mask[i_e_, i_b] = 1
-            self._solver._func_solve_mass_batched(self.grad, self.Mgrad, i_b)
+                self._solver.mass_mat_mask[i_e_, i_b] = True
+            self._solver._func_solve_mass_batched(self.grad, self.Mgrad, array_class.PLACEHOLDER, i_b)
             for i_e in range(self._solver.n_entities):
-                self._solver._mass_mat_mask[i_e, i_b] = 1
-
+                self._solver.mass_mat_mask[i_e, i_b] = True
         elif ti.static(self._solver_type == gs.constraint_solver.Newton):
             self._func_nt_chol_solve(island, i_b)
 

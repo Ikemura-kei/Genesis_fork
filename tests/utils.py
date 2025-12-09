@@ -1,5 +1,7 @@
 import platform
+import io
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -9,6 +11,7 @@ from datetime import datetime
 from functools import cache
 from itertools import chain
 from pathlib import Path
+from types import GeneratorType
 from typing import Literal, Sequence
 
 import cpuinfo
@@ -30,8 +33,8 @@ from genesis.options.morphs import URDF_FORMAT, MJCF_FORMAT, MESH_FORMATS, GLTF_
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
 
-HUGGINGFACE_ASSETS_REVISION = "0c0bb46db0978a59524381194478cf390b3ff996"
-HUGGINGFACE_SNAPSHOT_REVISION = "9a192b8d4d34401b7e20d43601ff73f80516cb2b"
+HUGGINGFACE_ASSETS_REVISION = "16e4eae0024312b84518f4b555dd630d6b34095a"
+HUGGINGFACE_SNAPSHOT_REVISION = "bfd02a635579cbd5aefa7027df54a433f8ad1915"
 
 MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
 IMAGE_EXTENSIONS = (".png", ".jpg")
@@ -52,7 +55,7 @@ def get_hardware_fingerprint(include_gpu=True):
     # CPU info
     cpu_info = cpuinfo.get_cpu_info()
     infos = [
-        cpu_info.get("brand_raw", cpu_info.get("hardware_raw")),
+        next(filter(None, map(cpu_info.get, ("brand_raw", "hardware_raw", "vendor_id_raw")))),
         cpu_info.get("arch"),
     ]
 
@@ -153,23 +156,23 @@ def get_git_commit_info(ref="HEAD"):
         remote_url = subprocess.check_output(
             ["git", "remote", "get-url", remote_name], cwd=TEST_DIR, encoding="utf-8"
         ).strip()
-        if remote_url.startswith("https://github.com/"):
-            remote_handle = remote_url[19:-4]
-        elif remote_url.startswith("git@github.com:"):
-            remote_handle = remote_url[15:-4]
+        try:
+            remote_handle = re.search(r"github\.com[:/](.+?)(?:\.git)?$", remote_url).group(1)
+        except AttributeError:
+            pass
         if remote_handle == REPOSITY_URL:
             is_commit_on_default_branch = True
             break
     else:
         is_commit_on_default_branch = False
+    revision = f"{revision}@{remote_handle}"
 
-    # Return the contribution date as timestamp if and only if the HEAD commit is contained on main branch
+    # Return the contribution date as timestamp if and only if the HEAD commit is on main branch
     if is_commit_on_default_branch:
         timestamp = get_git_commit_timestamp(ref)
-        return revision, timestamp
+    else:
+        timestamp = float("nan")
 
-    revision = f"{revision}@{remote_handle}"
-    timestamp = float("nan")
     return revision, timestamp
 
 
@@ -205,12 +208,12 @@ def get_hf_dataset(
 
             # Make sure that download was successful
             has_files = False
-            for path in Path(asset_path).rglob(pattern):
+            for path in Path(asset_path).glob(pattern):
                 if not path.is_file():
                     continue
 
                 ext = path.suffix.lower()
-                if not ext in (URDF_FORMAT, MJCF_FORMAT, *IMAGE_EXTENSIONS, *MESH_EXTENSIONS):
+                if ext not in (URDF_FORMAT, MJCF_FORMAT, *IMAGE_EXTENSIONS, *MESH_EXTENSIONS):
                     continue
 
                 has_files = True
@@ -222,19 +225,19 @@ def get_hf_dataset(
                     try:
                         ET.parse(path)
                     except ET.ParseError as e:
-                        raise HTTPError(f"Impossible to parse XML file.") from e
+                        raise HTTPError("Impossible to parse XML file.") from e
                 elif path.suffix.lower() in IMAGE_EXTENSIONS:
                     try:
                         Image.open(path)
                     except UnidentifiedImageError as e:
-                        raise HTTPError(f"Impossible to parse Image file.") from e
+                        raise HTTPError("Impossible to parse Image file.") from e
                 elif path.suffix.lower() in MESH_EXTENSIONS:
                     # TODO: Validating mesh files is more tricky. Ignoring them for now.
                     pass
 
             if not has_files:
                 raise HTTPError("No file downloaded.")
-        except (HTTPError, FileNotFoundError) as e:
+        except (HTTPError, FileNotFoundError, RuntimeError):
             if i == num_retry - 1:
                 raise
             print(f"Failed to download assets from HuggingFace dataset. Trying again in {retry_delay}s...")
@@ -245,7 +248,8 @@ def get_hf_dataset(
     return asset_path
 
 
-def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=""):
+def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=None):
+    # Determine absolute and relative tolerance from input arguments
     assert (tol is not None) ^ (atol is not None or rtol is not None)
     if tol is not None:
         atol = tol
@@ -255,21 +259,33 @@ def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=
     if atol is None:
         atol = 0.0
 
+    # Convert input arguments as numpy arrays
     args = [actual, desired]
     for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            arg = tensor_to_array(arg)
-        elif isinstance(arg, (tuple, list)):
-            arg = [tensor_to_array(val) for val in arg]
-        args[i] = np.asanyarray(arg)
+        if isinstance(arg, (GeneratorType, map)):
+            arg = tuple(arg)
+        if isinstance(arg, (tuple, list)):
+            arg = np.stack([tensor_to_array(val) for val in arg], axis=0)
+        args[i] = tensor_to_array(arg)
 
+    # Early return without checking anything is both arrays are empty (0D arrays have size 1).
     if all(e.size == 0 for e in args):
         return
 
-    np.testing.assert_allclose(*map(np.squeeze, args), atol=atol, rtol=rtol, err_msg=err_msg)
+    # Try to make sure both arrays have the exact same shape.
+    # First, try to broadcast both matrices. Then it is does not work, squeeze them before trying again.
+    try:
+        args = np.broadcast_arrays(*args)
+    except ValueError as e:
+        try:
+            args = np.broadcast_arrays(*map(np.squeeze, args))
+        except ValueError:
+            raise e
+
+    np.testing.assert_allclose(*args, atol=atol, rtol=rtol, err_msg=err_msg)
 
 
-def assert_array_equal(actual, desired, *, err_msg=""):
+def assert_array_equal(actual, desired, *, err_msg=None):
     assert_allclose(actual, desired, atol=0.0, rtol=0.0, err_msg=err_msg)
 
 
@@ -491,6 +507,7 @@ def build_mujoco_sim(
     model.opt.solver = mj_solver
     model.opt.integrator = mj_integrator
     model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ISLAND
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
@@ -1014,3 +1031,10 @@ def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos=None, qvel=None, 
         gs_sim.scene.step()
         # if gs_sim.scene.visualizer:
         #     gs_sim.scene.visualizer.update()
+
+
+def rgb_array_to_png_bytes(rgb_arr: np.ndarray) -> bytes:
+    img = Image.fromarray(rgb_arr)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return buffer.getvalue()

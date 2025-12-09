@@ -3,15 +3,15 @@ import pickle as pkl
 
 import fast_simplification
 import numpy as np
-import numpy.typing as npt
 import trimesh
 
 import genesis as gs
-from genesis.options.surfaces import Surface
 import genesis.utils.mesh as mu
 import genesis.utils.gltf as gltf_utils
 import genesis.utils.particle as pu
+from genesis.options.surfaces import Surface
 from genesis.repr_base import RBC
+from genesis.utils.misc import redirect_libc_stderr
 
 
 class Mesh(RBC):
@@ -44,7 +44,7 @@ class Mesh(RBC):
         self,
         mesh,
         surface: Surface | None = None,
-        uvs: npt.NDArray | None = None,
+        uvs: "np.typing.NDArray | None" = None,
         convexify=False,
         decimate=False,
         decimate_face_num=500,
@@ -125,7 +125,8 @@ class Mesh(RBC):
 
         if not is_cached_loaded:
             # Importing pymeshlab is very slow and not used very often. Let's delay import.
-            import pymeshlab
+            with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
+                import pymeshlab
 
             gs.logger.info("Remeshing for tetrahedralization...")
             ms = pymeshlab.MeshSet()
@@ -153,18 +154,7 @@ class Mesh(RBC):
         """
         Tetrahedralize the mesh.
         """
-        # Importing pyvista and tetgen are very slow and not used very often. Let's delay import.
-        import pyvista as pv
-        import tetgen
-
-        pv_obj = pv.PolyData(
-            self.verts, np.concatenate([np.full((self.faces.shape[0], 1), self.faces.shape[1]), self.faces], axis=1)
-        )
-        tet = tetgen.TetGen(pv_obj)
-        switches = mu.make_tetgen_switches(tet_cfg)
-        verts, elems = tet.tetrahedralize(switches=switches)
-        # visualize_tet(tet, pv_obj, show_surface=False, plot_cell_qual=False)
-        return verts, elems
+        return mu.tetrahedralize_mesh(self._mesh, tet_cfg)
 
     def particlize(
         self,
@@ -175,15 +165,8 @@ class Mesh(RBC):
         Sample particles using the mesh volume.
         """
         if "pbs" in sampler:
-            try:
-                positions = pu.trimesh_to_particles_pbs(self._mesh, p_size, sampler)
-            except gs.GenesisException:
-                sampler = "random"
-
-        if sampler in ("random", "regular"):
-            positions = pu.trimesh_to_particles_simple(self._mesh, p_size, sampler)
-
-        return positions
+            return pu.trimesh_to_particles_pbs(self._mesh, p_size, sampler)
+        return pu.trimesh_to_particles_simple(self._mesh, p_size, sampler)
 
     def clear_visuals(self):
         """
@@ -211,7 +194,7 @@ class Mesh(RBC):
         Copy the mesh.
         """
         return Mesh(
-            mesh=self._mesh.copy(include_cache=True),
+            mesh=self._mesh.copy(**(dict(include_cache=True) if isinstance(self._mesh, trimesh.Trimesh) else {})),
             surface=self._surface.copy(),
             uvs=self._uvs.copy() if self._uvs is not None else None,
             metadata=self._metadata.copy(),
@@ -237,7 +220,7 @@ class Mesh(RBC):
             surface.update_texture()
         else:
             surface = surface.copy()
-        mesh = mesh.copy(include_cache=True)
+        mesh = mesh.copy(**(dict(include_cache=True) if isinstance(mesh, trimesh.Trimesh) else {}))
 
         try:  # always parse uvs because roughness and normal map also need uvs
             uvs = mesh.visual.uv.copy()
@@ -250,9 +233,10 @@ class Mesh(RBC):
         color_factor = None
         opacity = 1.0
 
-        if mesh.visual.defined:
-            if mesh.visual.kind == "texture":
-                material = mesh.visual.material
+        visual = mesh.visual
+        if isinstance(visual, trimesh.visual.texture.TextureVisuals) and visual.defined:
+            if visual.kind == "texture":
+                material = visual.material
 
                 # TODO: Parsing PBR in obj or not
                 # trimesh from .obj file will never use PBR material, but that from .glb file will
@@ -283,12 +267,15 @@ class Mesh(RBC):
                         else:
                             color_factor = (*color_factor[:3], color_factor[3] * opacity)
                 else:
-                    gs.raise_exception()
-
+                    gs.raise_exception(f"Unsupported Trimesh material type '{type(material)}'.")
             else:
                 # TODO: support vertex/face colors in luisa
-                color_factor = tuple(np.array(mesh.visual.main_color, dtype=np.float32) / 255.0)
-
+                color_factor = tuple(np.array(visual.main_color, dtype=np.float32) / 255.0)
+        elif isinstance(visual, trimesh.visual.color.VertexColor) and visual.vertex_colors.size > 0:
+            color = np.unique(visual.vertex_colors, axis=0)
+            if len(color) > 1:
+                gs.raise_exception("Loading point clouds with heterogeneous colors is not supported.")
+            color_factor = tuple(np.array(color, dtype=np.float32) / 255.0)
         else:
             # use white color as default
             color_factor = (1.0, 1.0, 1.0, 1.0)
@@ -344,7 +331,7 @@ class Mesh(RBC):
     def from_morph_surface(cls, morph, surface=None):
         """
         Create a genesis.Mesh from morph and surface options.
-        If the morph is a Mesh morph (morphs.Mesh), it could contain multiple submeshes, so we return a list.
+        If the morph is a Mesh morph (morphs.Mesh), it could contain multiple sub-meshes, so we return a list.
         """
         if isinstance(morph, gs.options.morphs.Mesh):
             if morph.is_format(gs.options.morphs.MESH_FORMATS):
@@ -354,6 +341,15 @@ class Mesh(RBC):
                     meshes = mu.parse_mesh_trimesh(morph.file, morph.group_by_material, morph.scale, surface)
                 else:
                     meshes = gltf_utils.parse_mesh_glb(morph.file, morph.group_by_material, morph.scale, surface)
+                if morph.parse_glb_with_zup:
+                    for mesh in meshes:
+                        mesh.convert_to_zup()
+                else:
+                    gs.logger.warning(
+                        "GLTF is using y-up while Genesis uses z-up. Please set parse_glb_with_zup=True"
+                        " in morph options if you find the mesh is 90-degree rotated. We will set parse_glb_with_zup=True"
+                        " and rotate glb mesh by default later and gradually enforce this option."
+                    )
             elif morph.is_format(gs.options.morphs.USD_FORMATS):
                 import genesis.utils.usda as usda_utils
 
@@ -362,9 +358,7 @@ class Mesh(RBC):
                 assert all(isinstance(mesh, trimesh.Trimesh) for mesh in morph.files)
                 meshes = [mu.trimesh_to_mesh(mesh, morph.scale, surface) for mesh in morph.files]
             else:
-                gs.raise_exception(
-                    f"File type not supported (yet). Submit a feature request if you need this: {morph.file}."
-                )
+                gs.raise_exception(f"File type not supported: {morph.file}")
 
             return meshes
 
@@ -381,7 +375,7 @@ class Mesh(RBC):
             else:
                 gs.raise_exception()
 
-            metadata = {"mesh_path": morph.file} if isinstance(morph, gs.options.morphs.FileMorph) else {}
+            metadata = {}
             return cls.from_trimesh(tmesh, surface=surface, metadata=metadata)
 
     def set_color(self, color):
@@ -400,9 +394,15 @@ class Mesh(RBC):
         """
         self._mesh.visual = mu.surface_uvs_to_trimesh_visual(self.surface, self.uvs, len(self.verts))
 
+    def convert_to_zup(self):
+        """
+        Convert the mesh to z-up.
+        """
+        self._mesh.apply_transform(mu.Y_UP_TRANSFORM.T)
+
     def apply_transform(self, T):
         """
-        Apply a 4x4 transformation matrix to the mesh.
+        Apply a 4x4 transformation matrix (translation on the right column) to the mesh.
         """
         self._mesh.apply_transform(T)
 

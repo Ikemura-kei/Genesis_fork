@@ -2,22 +2,19 @@ import os
 import pickle
 import sys
 import time
-from typing import TYPE_CHECKING
+import weakref
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
 import gstaichi as ti
-from numpy.typing import ArrayLike
+from gstaichi.lang import impl
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
-from genesis.engine.entities.base_entity import Entity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import Material
-from genesis.engine.entities import Emitter
 from genesis.engine.states.solvers import SimState
-from genesis.engine.simulator import Simulator
 from genesis.options import (
     AvatarOptions,
     BaseCouplerOptions,
@@ -37,14 +34,18 @@ from genesis.options import (
 from genesis.options.morphs import Morph
 from genesis.options.surfaces import Surface
 from genesis.options.renderers import Rasterizer, RendererOptions
+from genesis.options.sensors import SensorOptions
+from genesis.options.recorders import RecorderOptions
+from genesis.recorders import RecorderManager
 from genesis.repr_base import RBC
 from genesis.utils.tools import FPSTracker
-from genesis.utils.misc import redirect_libc_stderr, tensor_to_array
+from genesis.utils.misc import tensor_to_array, sanitize_index
 from genesis.vis import Visualizer
 from genesis.utils.warnings import warn_once
 
 if TYPE_CHECKING:
-    from genesis.sensors.base_sensor import SensorOptions
+    from genesis.engine.entities.base_entity import Entity
+    from genesis.recorders import Recorder
 
 
 @gs.assert_initialized
@@ -106,6 +107,9 @@ class Scene(RBC):
         show_viewer: bool | None = None,
         show_FPS: bool | None = None,  # deprecated, use profiling_options.show_FPS instead
     ):
+        # Delay simulator import to allow specifying gstaichi array type at init
+        from genesis.engine.simulator import Simulator
+
         # Handling of default arguments
         sim_options = sim_options or SimOptions()
         coupler_options = coupler_options or LegacyCouplerOptions()
@@ -194,6 +198,9 @@ class Scene(RBC):
             renderer_options=renderer,
         )
 
+        # recorders
+        self._recorder_manager = RecorderManager(self._sim.dt)
+
         # emitters
         self._emitters = gs.List()
 
@@ -207,9 +214,7 @@ class Scene(RBC):
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
 
     def __del__(self):
-        if self._visualizer is not None:
-            self._visualizer.destroy()
-            self._visualizer = None
+        self.destroy()
 
     def _validate_options(
         self,
@@ -269,6 +274,53 @@ class Scene(RBC):
 
         if not isinstance(renderer_options, RendererOptions):
             gs.raise_exception("`renderer` should be an instance of `gs.renderers.Renderer`.")
+
+        # Validate rigid_options against sim_options
+        if impl.current_cfg().debug:
+            if sim_options.requires_grad and not gs.use_ndarray:
+                gs.raise_exception(
+                    "Genesis debug mode together with performance mode is not supported when gradient computation is "
+                    "enabled, i.e. `sim_options.requires_grad=True`."
+                )
+        else:
+            if sim_options.requires_grad and gs.use_ndarray:
+                gs.logger.info(
+                    "Use GsTaichi dynamic array mode while enabling gradient computation is not recommended. Please "
+                    "enable performance mode at init for efficiency, i.e. 'gs.init(..., performance_mode=True)'."
+                )
+        if rigid_options.box_box_detection is None:
+            rigid_options.box_box_detection = not sim_options.requires_grad
+        elif rigid_options.box_box_detection and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.box_box_detection` cannot be True when `sim_options.requires_grad` is True."
+            )
+        if rigid_options.use_gjk_collision is None:
+            rigid_options.use_gjk_collision = sim_options.requires_grad
+        elif not rigid_options.use_gjk_collision and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.use_gjk_collision` cannot be False when `sim_options.requires_grad` is True."
+            )
+        if rigid_options.enable_mujoco_compatibility and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.enable_mujoco_compatibility` cannot be True when `sim_options.requires_grad` is True."
+            )
+
+    def destroy(self):
+        if getattr(self, "_recorder_manager", None) is not None:
+            if self._recorder_manager.is_recording:
+                self._recorder_manager.stop()
+            self._recorder_manager = None
+
+        if getattr(self, "_visualizer", None) is not None:
+            self._visualizer.destroy()
+            self._visualizer = None
+
+        # Stop tracking this scene
+        try:
+            gs._scene_registry.remove(weakref.ref(self))
+        except ValueError:
+            # This scene may have been destroyed previously
+            pass
 
     @gs.assert_unbuilt
     def add_entity(
@@ -357,11 +409,11 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
 
-        elif isinstance(material, (gs.materials.SF.Smoke)):
+        elif isinstance(material, gs.materials.SF.Smoke):
             if surface.vis_mode is None:
                 surface.vis_mode = "particle"
 
-            if surface.vis_mode not in ["particle"]:
+            if surface.vis_mode not in ("particle",):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
@@ -375,20 +427,20 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'particle', 'recon']."
                 )
 
-        elif isinstance(material, (gs.materials.FEM.Base)):
+        elif isinstance(material, gs.materials.FEM.Base):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
-            if surface.vis_mode not in ["visual"]:
+            if surface.vis_mode not in ("visual",):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual']."
                 )
 
-        elif isinstance(material, (gs.materials.Hybrid)):  # determine the visual of the outer soft part
+        elif isinstance(material, gs.materials.Hybrid):  # determine the visual of the outer soft part
             if surface.vis_mode is None:
                 surface.vis_mode = "particle"
 
-            if surface.vis_mode not in ["particle", "visual"]:
+            if surface.vis_mode not in ("particle", "visual"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'visual']."
                 )
@@ -409,8 +461,8 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def link_entities(
         self,
-        parent_entity: Entity,
-        child_entity: Entity,
+        parent_entity: "Entity",
+        child_entity: "Entity",
         parent_link_name="",
         child_link_name="",
     ):
@@ -454,7 +506,7 @@ class Scene(RBC):
     def add_mesh_light(
         self,
         morph: Morph | None = None,
-        color: ArrayLike | None = (1.0, 1.0, 1.0, 1.0),
+        color: "np.typing.ArrayLike | None" = (1.0, 1.0, 1.0, 1.0),
         intensity: float = 20.0,
         revert_dir: bool | None = False,
         double_sided: bool | None = False,
@@ -479,14 +531,9 @@ class Scene(RBC):
             The cutoff angle of the light in degrees. Range: [0.0, 180.0].
         """
         if not isinstance(self.renderer_options, gs.renderers.RayTracer):
-            if isinstance(self.renderer_options, gs.renderers.BatchRenderer):
-                gs.raise_exception(
-                    "This method is only supported by RayTracer. Please use 'add_light' when using BatchRenderer."
-                )
-            else:
-                gs.raise_exception(
-                    "This method is only supported by RayTracer. Impossible to add light when using Rasterizer."
-                )
+            gs.raise_exception(
+                "This method is only supported by RayTracer. Please use 'add_light' when using BatchRenderer."
+            )
 
         if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
             gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
@@ -496,9 +543,9 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def add_light(
         self,
-        pos: ArrayLike,
-        dir: ArrayLike,
-        color: ArrayLike = (1.0, 1.0, 1.0),
+        pos: "np.typing.ArrayLike | None",
+        dir: "np.typing.ArrayLike | None",
+        color: "np.typing.ArrayLike | None" = (1.0, 1.0, 1.0),
         intensity: float = 1.0,
         directional: bool = False,
         castshadow: bool = True,
@@ -529,20 +576,47 @@ class Scene(RBC):
             Light intensity will attenuate by distance with (1 / (1 + attenuation * distance ^ 2))
         """
         if not isinstance(self.renderer_options, gs.renderers.BatchRenderer):
-            if isinstance(self.renderer_options, gs.renderers.BatchRenderer):
-                gs.raise_exception(
-                    "This method is only supported by BatchRenderer. Please use 'add_mesh_light' when using RayTracer."
-                )
-            else:
-                gs.raise_exception(
-                    "This method is only supported by BatchRenderer. Impossible to add light when using Rasterizer."
-                )
+            gs.raise_exception(
+                "This method is only supported by BatchRenderer. Please use 'add_mesh_light' when using RayTracer."
+            )
 
         self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
 
     @gs.assert_unbuilt
     def add_sensor(self, sensor_options: "SensorOptions"):
+        """
+        Add a sensor to the scene.
+
+        Sensors extract information from the scene without modifying the physics simulation.
+
+        Parameters
+        ----------
+        sensor_options : SensorOptions
+            The options for the sensor.
+        """
         return self._sim._sensor_manager.create_sensor(sensor_options)
+
+    @gs.assert_unbuilt
+    def start_recording(self, data_func: Callable, rec_options: "RecorderOptions") -> "Recorder":
+        """
+        Automatically read and process data. See RecorderOptions for more details.
+
+        Data from `data_func` is automatically read and processed using the recorder at the
+        frequency `rec_options.hz` (or every step if not specified) as the scene is stepped.
+
+        Parameters
+        ----------
+        data_func: Callable
+            A function with no arguments that returns the data to be recorded.
+        rec_options : RecorderOptions
+            The options for the recording.
+
+        Returns
+        -------
+        recorder : Recorder
+            The created recorder object.
+        """
+        return self._recorder_manager.add_recorder(data_func, rec_options)
 
     @gs.assert_unbuilt
     def add_camera(
@@ -655,8 +729,9 @@ class Scene(RBC):
         -------
         emitter : genesis.Emitter
             The created emitter object.
-
         """
+        from genesis.engine.entities import Emitter
+
         if self.requires_grad:
             gs.raise_exception("Emitter is not supported in differentiable mode.")
 
@@ -712,7 +787,7 @@ class Scene(RBC):
         env_spacing=(0.0, 0.0),
         n_envs_per_row: int | None = None,
         center_envs_at_origin=True,
-        compile_kernels=True,
+        compile_kernels=None,
     ):
         """
         Builds the scene once all entities have been added. This operation is required before running the simulation.
@@ -720,32 +795,37 @@ class Scene(RBC):
         Parameters
         ----------
         n_envs : int
-            Number of parallel environments to create. If `n_envs` is 0, the scene will not have a batching dimension. If `n_envs` is greater than 0, the first dimension of all the input and returned states will be the batch dimension.
+            Number of parallel environments to create.
+            If `n_envs` is 0, the scene will not have a batching dimension. When greater than 0, the first dimension of
+            all the input and returned states will be the batch dimension.
         env_spacing : tuple of float, shape (2,)
-            The spacing between adjacent environments in the scene. This is for visualization purposes only and does not change simulation-related poses.
+            The spacing between adjacent environments in the scene.
+            This is for visualization purposes only and does not change simulation-related poses.
         n_envs_per_row : int
             The number of environments per row for visualization. If None, it will be set to `sqrt(n_envs)`.
         center_envs_at_origin : bool
             Whether to put the center of all the environments at the origin (for visualization only).
-        compile_kernels : bool
-            Whether to compile the simulation kernels inside `build()`. If False, the kernels will not be compiled (or loaded if found in the cache) until the first call of `scene.step()`. This is useful for cases you don't want to run the actual simulation, but rather just want to visualize the created scene.
+        compile_kernels : bool, optional
+            This parameter is deprecated and will be removed in future release.
         """
+        if compile_kernels is not None:
+            warn_once("`compile_kernels` is deprecated and will be removed in future release.")
+            compile_kernels = True
+
         with gs.logger.timer(f"Building scene ~~~<{self._uid}>~~~..."):
             self._parallelize(n_envs, env_spacing, n_envs_per_row, center_envs_at_origin)
 
             # simulator
-            with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
-                self._sim.build()
+            self._sim.build()
 
             # reset state
             self._reset()
 
             self._is_built = True
 
-        if compile_kernels:
-            with gs.logger.timer("Compiling simulation kernels..."):
-                self._sim.step()
-                self._reset()
+        with gs.logger.timer("Compiling simulation kernels..."):
+            self._sim.step()
+            self._reset()
 
         # visualizer
         with gs.logger.timer("Building visualizer..."):
@@ -754,7 +834,18 @@ class Scene(RBC):
         if self.profiling_options.show_FPS:
             self.FPS_tracker = FPSTracker(self.n_envs, alpha=self.profiling_options.FPS_tracker_alpha)
 
-        gs.global_scene_list.add(self)
+        # recorders
+        self._recorder_manager.build()
+
+        # Update global scene registry
+        def _destroy_callback(scene_ref: weakref.ReferenceType["Scene"]):
+            scene = scene_ref()
+            for i, scene_ref_i in enumerate(gs._scene_registry):
+                if scene is scene_ref_i():
+                    del gs._scene_registry[i]
+                    break
+
+        gs._scene_registry.append(weakref.ref(self, _destroy_callback))
 
     def _parallelize(
         self,
@@ -793,15 +884,18 @@ class Scene(RBC):
             - for non-batched env, we only parallelize certain loops that have big loop size
             - for batched env, we parallelize all loops
         - When using cpu, we serialize everything.
-            - This is emprically as fast as parallel loops even with big batchsize (tested up to B=10000), because invoking multiple cpu processes cannot utilize all cpu usage.
-            - In order to exploit full cpu power, users are encouraged to launch multiple processes manually, and each will use a single cpu thred.
+            - Parallelization only provides a boost for n_envs >= num_threads and ti_num_threads > 1.
+              It is always disabled by default but can be enforced by setting the env var `GS_PARA_LEVEL=2`.
+            - In order to exploit full cpu power, users are encouraged to launch multiple processes manually and set
+              env var `TI_NUM_THREADS=1`, so that each process uses a single cpu thread.
         """
         if gs.backend == gs.cpu:
-            self._para_level = gs.PARA_LEVEL.NEVER
-        elif self.n_envs == 0:
-            self._para_level = gs.PARA_LEVEL.PARTIAL
+            para_level = gs.PARA_LEVEL.NEVER
+        elif self.n_envs <= 1:
+            para_level = gs.PARA_LEVEL.PARTIAL
         else:
-            self._para_level = gs.PARA_LEVEL.ALL
+            para_level = gs.PARA_LEVEL.ALL
+        self._para_level = int(os.environ.get("GS_PARA_LEVEL", para_level))
 
     @gs.assert_built
     def reset(self, state: SimState | None = None, envs_idx=None):
@@ -818,6 +912,7 @@ class Scene(RBC):
         """
         gs.logger.debug(f"Resetting Scene ~~~<{self._uid}>~~~.")
         self._reset(state, envs_idx=envs_idx)
+        self._recorder_manager.reset(envs_idx)
 
     def _reset(self, state: SimState | None = None, *, envs_idx=None):
         if self._is_built:
@@ -836,7 +931,8 @@ class Scene(RBC):
 
         # Clear the entire cache of the visualizer.
         # TODO: Could be optimized to only clear cache associated the the environments being reset.
-        self._visualizer.reset()
+        if self._visualizer.is_built:
+            self._visualizer.reset()
 
         # TODO: sets _next_particle = 0; not sure this is env isolation safe
         for emitter in self._emitters:
@@ -874,9 +970,17 @@ class Scene(RBC):
 
         if update_visualizer:
             self._visualizer.update(force=False, auto=refresh_visualizer)
+            # Update IPC GUI if enabled
+            if hasattr(self, "_ipc_gui_enabled") and self._ipc_gui_enabled:
+                self._sim._coupler.update_ipc_gui()
 
         if self.profiling_options.show_FPS:
             self.FPS_tracker.step()
+
+        self._recorder_manager.step(self._sim.cur_step_global)
+
+    def stop_recording(self):
+        self._recorder_manager.stop()
 
     def _step_grad(self):
         self._sim.collect_output_grads()
@@ -1189,12 +1293,12 @@ class Scene(RBC):
         return rgb_out, depth_out, seg_out, normal_out
 
     @gs.assert_built
-    def clear_debug_object(self, object):
+    def clear_debug_object(self, obj):
         """
         Clears all the debug objects in the scene.
         """
         with self._visualizer.viewer_lock:
-            self._visualizer.context.clear_debug_object(object)
+            self._visualizer.context.clear_debug_object(obj)
 
     @gs.assert_built
     def clear_debug_objects(self):
@@ -1228,7 +1332,7 @@ class Scene(RBC):
         Returns
         -------
         dict[str, np.ndarray]
-            Mapping ``"Class.attr[.member]" → array`` with raw field data.
+            Mapping ``"Class.attr[.member]" -> array`` with raw field data.
         """
         arrays: dict[str, np.ndarray] = {}
 
@@ -1287,36 +1391,21 @@ class Scene(RBC):
     # ----------------------------------- utilities --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def _sanitize_envs_idx(self, envs_idx, *, unsafe=False):
-        # Handling default argument and special cases
+    def _sanitize_envs_idx(
+        self, envs_idx: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None
+    ) -> torch.Tensor:
         if envs_idx is None:
             return self._envs_idx
 
         if self.n_envs == 0:
             gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
 
-        if isinstance(envs_idx, slice):
+        if isinstance(envs_idx, (slice, range)):
             return self._envs_idx[envs_idx]
         if isinstance(envs_idx, (int, np.integer)):
             return self._envs_idx[envs_idx : envs_idx + 1]
 
-        # Early return if unsafe
-        if unsafe:
-            return envs_idx
-
-        # Perform a bunch of sanity checks
-        _envs_idx = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device).contiguous()
-        if _envs_idx is not envs_idx:
-            gs.logger.debug(ALLOCATE_TENSOR_WARNING)
-        _envs_idx = torch.atleast_1d(_envs_idx)
-
-        if _envs_idx.ndim != 1:
-            gs.raise_exception("Expecting a 1D tensor for `envs_idx`.")
-
-        if (_envs_idx < 0).any() or (_envs_idx >= self.n_envs).any():
-            gs.raise_exception("`envs_idx` exceeds valid range.")
-
-        return _envs_idx
+        return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -1394,7 +1483,7 @@ class Scene(RBC):
         return self._sim.active_solvers
 
     @property
-    def entities(self) -> list[Entity]:
+    def entities(self) -> list["Entity"]:
         """All the entities in the scene."""
         return self._sim.entities
 

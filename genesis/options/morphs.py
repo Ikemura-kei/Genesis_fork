@@ -11,16 +11,14 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 import genesis as gs
-import genesis.utils.geom as gu
 import genesis.utils.misc as mu
 
 from .misc import CoacdOptions
 from .options import Options
 
-
 URDF_FORMAT = ".urdf"
 MJCF_FORMAT = ".xml"
-MESH_FORMATS = (".obj", ".ply", ".stl")
+MESH_FORMATS = (".obj", ".stl")
 GLTF_FORMATS = (".glb", ".gltf")
 USD_FORMATS = (".usd", ".usda", ".usdc", ".usdz")
 
@@ -76,10 +74,7 @@ class Morph(Options):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
     is_free : bool, optional
-        Whether the entity is free to move. Defaults to True. **This is only used for RigidEntity.**
-        This determines whether the entity's geoms have their vertices put into StructFreeVertsState or
-        StructFixedVertsState, and effectively whether they're stored per batch-element, or stored once and shared
-        for the entire batch. That affects correct processing of collision detection.
+        This parameter is deprecated.
     """
 
     # Note: pos, euler, quat store only initial varlues at creation time, and are unaffected by sim
@@ -89,10 +84,11 @@ class Morph(Options):
     visualization: bool = True
     collision: bool = True
     requires_jac_and_IK: bool = False
-    is_free: bool = True
+    is_free: bool | None = None
 
     def __init__(self, **data):
         super().__init__(**data)
+
         if self.pos is not None:
             if not isinstance(self.pos, tuple) or len(self.pos) != 3:
                 gs.raise_exception("`pos` should be a 3-tuple.")
@@ -115,6 +111,9 @@ class Morph(Options):
 
         if not self.visualization and not self.collision:
             gs.raise_exception("`visualization` and `collision` cannot both be False.")
+
+        if self.is_free is not None:
+            gs.logger.warning("Morph option 'is_free' has been removed. User-specified value will be ignored.")
 
     def _repr_type(self):
         return f"<gs.morphs.{self.__class__.__name__}>"
@@ -167,6 +166,9 @@ class Primitive(Morph):
         Defaults to False. **This is only used for RigidEntity.**
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -177,6 +179,7 @@ class Primitive(Morph):
 
     # Rigid specific
     fixed: bool = False
+    batch_fixed_verts: bool = True
     contype: int = 0xFFFF
     conaffinity: int = 0xFFFF
 
@@ -216,6 +219,9 @@ class Box(Primitive, TetGenMixin):
         **This is only used for RigidEntity.**
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -298,6 +304,9 @@ class Cylinder(Primitive, TetGenMixin):
         **This is only used for RigidEntity.**
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -360,6 +369,9 @@ class Sphere(Primitive, TetGenMixin):
         **This is only used for RigidEntity.**
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -423,6 +435,9 @@ class Plane(Primitive):
         `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -436,6 +451,7 @@ class Plane(Primitive):
     """
 
     fixed: bool = True
+    batch_fixed_verts: bool = False
     normal: tuple = (0, 0, 1)
     plane_size: tuple = (1e3, 1e3)
     tile_size: tuple = (1, 1)
@@ -504,6 +520,8 @@ class FileMorph(Morph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
+    parse_glb_with_zup : bool, optional
+        Whether to use zup to load glb files. Defaults to False.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -511,6 +529,9 @@ class FileMorph(Morph):
     collision : bool, optional
         Whether the entity needs to be considered for collision checking. Defaults to True.
         `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     requires_jac_and_IK : bool, optional
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
@@ -527,6 +548,8 @@ class FileMorph(Morph):
     decompose_robot_error_threshold: float = float("inf")
     coacd_options: Optional[CoacdOptions] = None
     recompute_inertia: bool = False
+    parse_glb_with_zup: bool = False
+    batch_fixed_verts: bool = False
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -643,8 +666,13 @@ class Mesh(FileMorph, TetGenMixin):
         **This is only used for RigidEntity.**
     parse_glb_with_trimesh : bool, optional
         Whether to use trimesh to load glb files. Defaults to False, in which case pygltflib will be used.
+    parse_glb_with_zup : bool, optional
+        Whether to use zup to load glb files. Defaults to False.
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -733,10 +761,12 @@ class MJCF(FileMorph):
         If a 3-tuple, it scales along each axis. Defaults to 1.0.
         Note that 3-tuple scaling is only supported for `gs.morphs.Mesh`.
     pos : tuple, shape (3,), optional
-        The position of the entity's baselink in meters. Defaults to (0.0, 0.0, 0.0).
+        The position of the entity in meters as a translational offset. Mathematically, 'pos' and 'euler' options
+        correspond respectively to the translational and rotational part of a transform that it is (left) applied on the
+        original pose of all floating base links in the kinematic tree indiscriminately. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity's baselink in degrees. This follows scipy's extrinsic x-y-z rotation convention.
-        Defaults to (0.0, 0.0, 0.0).
+        The euler angles of the entity in degrees as a rotational offset. This follows scipy's extrinsic x-y-z rotation
+        convention. See 'pos' option documentation for details. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity's baselink. If specified, `euler` will be ignored.
         Defaults to None.
@@ -767,6 +797,8 @@ class MJCF(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
+    parse_glb_with_zup : bool, optional
+        Whether to use zup to load glb files. Defaults to False.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -775,6 +807,9 @@ class MJCF(FileMorph):
         `visualization` and `collision` cannot both be False.
     requires_jac_and_IK : bool, optional
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to True.
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     default_armature : float, optional
         Default rotor inertia of the actuators. In practice it is applied to all joints regardless of whether they are
         actuated. None to disable. Default to 0.1.
@@ -833,10 +868,12 @@ class URDF(FileMorph):
         If a 3-tuple, it scales along each axis. Defaults to 1.0.
         Note that 3-tuple scaling is only supported for `gs.morphs.Mesh`.
     pos : tuple, shape (3,), optional
-        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+        The position of the entity in meters as a translational offset. Mathematically, 'pos' and 'euler' options
+        correspond respectively to the translational and rotational part of a transform that it is (left) applied on the
+        original pose of all floating base links in the kinematic tree indiscriminately. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention.
-        Defaults to (0.0, 0.0, 0.0).
+        The euler angles of the entity in degrees as a rotational offset. This follows scipy's extrinsic x-y-z rotation
+        convention. See 'pos' option documentation for details. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     decimate : bool, optional
@@ -866,6 +903,8 @@ class URDF(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
+    parse_glb_with_zup : bool, optional
+        Whether to use zup to load glb files. Defaults to False.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -876,6 +915,9 @@ class URDF(FileMorph):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to True.
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False.
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     prioritize_urdf_material : bool, optional
         Sometimes a geom in a urdf file will be assigned a color, and the geom asset file also contains its own visual
         material. This parameter controls whether to prioritize the URDF-defined material over the asset's own material.
@@ -924,10 +966,12 @@ class Drone(FileMorph):
         The scaling factor for the size of the entity. If a float, it scales uniformly. If a 3-tuple, it scales along
         each axis. Defaults to 1.0. Note that 3-tuple scaling is only supported for `gs.morphs.Mesh`.
     pos : tuple, shape (3,), optional
-        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+        The position of the entity in meters as a translational offset. Mathematically, 'pos' and 'euler' options
+        correspond respectively to the translational and rotational part of a transform that it is (left) applied on the
+        original pose of all floating base links in the kinematic tree indiscriminately. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention. Defaults to
-        (0.0, 0.0, 0.0).
+        The euler angles of the entity in degrees as a rotational offset. This follows scipy's extrinsic x-y-z rotation
+        convention. See 'pos' option documentation for details. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     decimate : bool, optional
@@ -957,6 +1001,8 @@ class Drone(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
+    parse_glb_with_zup : bool, optional
+        Whether to use zup to load glb files. Defaults to False.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -1088,14 +1134,19 @@ class Terrain(Morph):
         The height field to generate the terrain. If specified, all other configurations will be ignored.
         Defaults to None.
     name : str, optional
-        The name of the terrain to save
+        The name of the terrain. If specified, the terrain will only be generated once for a given set of options and
+        later loaded from cache, instead of being re-generated systematically when building the scene. This holds true
+        no matter if `randomize` is True.
     from_stored : str, optional
-        The path of the stored terrain to load
+        This parameter is deprecated.
     subterrain_parameters : dictionary, optional
         Lets users pick their own subterrain parameters.
+    batch_fixed_verts : bool, optional
+        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
+        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
     """
 
-    is_free: bool = False
+    batch_fixed_verts: bool = False
     randomize: bool = False  # whether to randomize the terrain
     n_subterrains: Tuple[int, int] = (3, 3)  # number of subterrains in x and y directions
     subterrain_size: Tuple[float, float] = (12.0, 12.0)  # meter
@@ -1108,7 +1159,7 @@ class Terrain(Morph):
         ["random_uniform_terrain", "pyramid_stairs_terrain", "sloped_terrain"],
     ]
     height_field: Any = None
-    name: str = "default"  # name to store and reuse the terrain
+    name: str | None = None
     from_stored: Any = None
     subterrain_parameters: dict[str, dict] | None = None
 
@@ -1174,6 +1225,14 @@ class Terrain(Morph):
             self.subterrain_size[1], self.horizontal_scale
         ):
             gs.raise_exception("`subterrain_size` should be divisible by `horizontal_scale`.")
+
+        if self.from_stored is not None:
+            if self.name is None:
+                self.name = self.from_stored
+            else:
+                if self.from_stored != self.name:
+                    gs.raise_exception("Terrain option 'from_stored' is deprecated and inconsistent with 'name'.")
+            gs.logger.warning("Terrain option 'from_stored' is deprecated. Please use 'name' instead.")
 
     @property
     def default_params(self):

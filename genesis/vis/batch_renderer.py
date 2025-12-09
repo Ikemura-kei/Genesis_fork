@@ -9,13 +9,18 @@ from trimesh.visual.color import ColorVisuals
 import genesis as gs
 from genesis.repr_base import RBC
 from genesis.constants import IMAGE_TYPE
+from genesis.utils.misc import ti_to_torch
 
 from .rasterizer_context import SegmentationColorMap
 
+# Optional imports for platform-specific functionality
 try:
-    from gs_madrona.renderer_gs import MadronaBatchRendererAdapter, GeomRetriever
-except ImportError as e:
-    gs.raise_exception_from("Madrona batch renderer is only supported on Linux x86-64.", e)
+    from gs_madrona.renderer_gs import MadronaBatchRendererAdapter
+
+    _MADRONA_AVAILABLE = True
+except ImportError:
+    MadronaBatchRendererAdapter = None
+    _MADRONA_AVAILABLE = False
 
 
 def _transform_camera_quat(quat):
@@ -28,7 +33,7 @@ def _make_tensor(data, *, dtype: torch.dtype = torch.float32):
     return torch.tensor(data, dtype=dtype, device=gs.device)
 
 
-class GenesisGeomRetriever(GeomRetriever):
+class GenesisGeomRetriever:
     def __init__(self, rigid_solver, seg_level):
         self.rigid_solver = rigid_solver
         self.seg_color_map = SegmentationColorMap(to_torch=True)
@@ -156,7 +161,7 @@ class GenesisGeomRetriever(GeomRetriever):
         args["tex_widths"] = np.array(mat_texture_widths, np.int32)
         args["tex_heights"] = np.array(mat_texture_heights, np.int32)
         args["tex_nchans"] = np.array(mat_texture_nchans, np.int32)
-        args["tex_offsets"] = np.array(mat_texture_offsets, np.int32)
+        args["tex_offsets"] = np.array(mat_texture_offsets, np.int64)
         args["tex_data"] = np.concatenate(mat_texture_data, axis=0) if mat_texture_data else np.array([], np.uint8)
         args["mat_tex_ids"] = (
             np.stack(mat_texture_ids, axis=0)
@@ -169,22 +174,22 @@ class GenesisGeomRetriever(GeomRetriever):
 
     # FIXME: Use a kernel to do it efficiently
     def retrieve_rigid_property_torch(self, num_worlds):
-        geom_rgb_torch = self.rigid_solver.vgeoms_info.color.to_torch()
+        geom_rgb_torch = ti_to_torch(self.rigid_solver.vgeoms_info.color)
         geom_rgb_int = (geom_rgb_torch * 255).to(torch.int32)
         geom_rgb_uint = (geom_rgb_int[:, 0] << 16) | (geom_rgb_int[:, 1] << 8) | geom_rgb_int[:, 2]
-        geom_rgb = geom_rgb_uint.unsqueeze(0).repeat(num_worlds, 1)
+        geom_rgb = geom_rgb_uint[None].repeat(num_worlds, 1)
 
         geom_mat_ids = torch.full((self.n_vgeoms,), -1, dtype=torch.int32, device=gs.device)
-        geom_mat_ids = geom_mat_ids.unsqueeze(0).repeat(num_worlds, 1)
+        geom_mat_ids = geom_mat_ids[None].repeat(num_worlds, 1)
 
         geom_sizes = torch.ones((self.n_vgeoms, 3), dtype=torch.float32, device=gs.device)
-        geom_sizes = geom_sizes.unsqueeze(0).repeat(num_worlds, 1, 1)
+        geom_sizes = geom_sizes[None].repeat(num_worlds, 1, 1)
         return geom_mat_ids, geom_rgb, geom_sizes
 
     # FIXME: Use a kernel to do it efficiently
     def retrieve_rigid_state_torch(self):
-        geom_pos = self.rigid_solver.vgeoms_state.pos.to_torch()
-        geom_rot = self.rigid_solver.vgeoms_state.quat.to_torch()
+        geom_pos = ti_to_torch(self.rigid_solver.vgeoms_state.pos)
+        geom_rot = ti_to_torch(self.rigid_solver.vgeoms_state.quat)
         geom_pos = geom_pos.transpose(0, 1).contiguous()
         geom_rot = geom_rot.transpose(0, 1).contiguous()
         return geom_pos, geom_rot
@@ -259,6 +264,9 @@ class BatchRenderer(RBC):
         """
         Build all cameras in the batch and initialize Moderona renderer
         """
+        if not _MADRONA_AVAILABLE:
+            gs.raise_exception("Madrona batch renderer is only supported on Linux x86-64.")
+
         if gs.backend != gs.cuda:
             gs.raise_exception("BatchRenderer requires CUDA backend.")
         gpu_id = gs.device.index if gs.device.index is not None else 0
@@ -292,8 +300,10 @@ class BatchRenderer(RBC):
             use_rasterizer=self._use_rasterizer,
         )
         self._renderer.init(
-            cam_pos_tensor=torch.stack([camera.get_pos() for camera in self._cameras], dim=1),
-            cam_rot_tensor=_transform_camera_quat(torch.stack([camera.get_quat() for camera in self._cameras], dim=1)),
+            cam_pos_tensor=torch.stack([torch.atleast_2d(camera.get_pos()) for camera in self._cameras], dim=1),
+            cam_rot_tensor=_transform_camera_quat(
+                torch.stack([torch.atleast_2d(camera.get_quat()) for camera in self._cameras], dim=1)
+            ),
             lights_pos_tensor=_make_tensor([light.pos for light in self._lights]).reshape((-1, 3)),
             lights_dir_tensor=_make_tensor([light.dir for light in self._lights]).reshape((-1, 3)),
             lights_rgb_tensor=_make_tensor([light.color for light in self._lights]).reshape((-1, 3)),
@@ -304,8 +314,8 @@ class BatchRenderer(RBC):
             lights_intensity_tensor=_make_tensor([light.intensity for light in self._lights]),
         )
 
-    def update_scene(self):
-        self._visualizer._context.update()
+    def update_scene(self, force_render: bool = False):
+        self._visualizer._context.update(force_render)
 
     def render(self, rgb=True, depth=False, segmentation=False, normal=False, antialiasing=False, force_render=False):
         """
@@ -355,11 +365,11 @@ class BatchRenderer(RBC):
             return tuple(arr if req else None for req, arr in zip(request, cached))
 
         # Update scene
-        self.update_scene()
+        self.update_scene(force_render)
 
         # Render only what is needed (flags still passed to renderer)
-        cameras_pos = torch.stack([camera.get_pos() for camera in self._cameras], dim=1)
-        cameras_quat = torch.stack([camera.get_quat() for camera in self._cameras], dim=1)
+        cameras_pos = torch.stack([torch.atleast_2d(camera.get_pos()) for camera in self._cameras], dim=1)
+        cameras_quat = torch.stack([torch.atleast_2d(camera.get_quat()) for camera in self._cameras], dim=1)
         cameras_quat = _transform_camera_quat(cameras_quat)
         render_flags = np.array(
             (

@@ -1,4 +1,3 @@
-import gc
 import os
 import sys
 
@@ -62,7 +61,10 @@ class Rasterizer(RBC):
     def remove_camera(self, camera):
         self._context.removenode(self._camera_nodes[camera.uid])
         del self._camera_nodes[camera.uid]
-        self._camera_targets[camera.uid].delete()
+        if self._offscreen:
+            self._camera_targets[camera.uid].delete()
+        else:
+            self._viewer.close_offscreen(self._camera_targets[camera.uid])
         del self._camera_targets[camera.uid]
 
     def render_camera(self, camera, rgb=True, depth=False, segmentation=False, normal=False):
@@ -140,16 +142,19 @@ class Rasterizer(RBC):
             normal_arr = retval[int(rgb + depth)]
         return rgb_arr, depth_arr, seg_idxc_arr, normal_arr
 
-    def update_scene(self):
-        self._context.update()
+    def update_scene(self, force_render: bool = False):
+        self._context.update(force_render)
 
     def destroy(self):
         for node in self._camera_nodes.values():
             self._context.remove_node(node)
         self._camera_nodes.clear()
-        for renderer in self._camera_targets.values():
+        for camera_target in self._camera_targets.values():
             try:
-                renderer.delete()
+                if self._offscreen:
+                    camera_target.delete()
+                elif self._viewer is not None:
+                    self._viewer.close_offscreen(camera_target)
             except OSError:
                 pass
         self._camera_targets.clear()
@@ -162,7 +167,6 @@ class Rasterizer(RBC):
                 pass
             del self._renderer
             self._renderer = None
-            gc.collect()
 
     @property
     def viewer(self):
