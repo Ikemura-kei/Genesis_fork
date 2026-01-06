@@ -998,23 +998,10 @@ class MPMSolver(Solver):
                 self.particles_info[i_p].muscle_direction[i] = muscle_direction[i_p_, i]
 
     @ti.kernel
-<<<<<<< HEAD
-    def _kernel_update_render_fields(self, f: ti.i32):
-        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            if self.particles_ng[f, i_p, i_b].active:
-                # self.particles_render[i_b, i_p].pos = self.particles[f, i_p, i_b].pos 
-                for j in ti.static(range(3)):
-                    self.particles_render[i_p, i_b].pos[j] = self.particles[f, i_p, i_b].pos[j] + self.envs_offset[i_b][j]
-                self.particles_render[i_p, i_b].vel = self.particles[f, i_p, i_b].vel
-            else:
-                self.particles_render[i_p, i_b].pos = gu.ti_nowhere()
-            self.particles_render[i_p, i_b].active = self.particles_ng[f, i_p, i_b].active
-=======
     def _kernel_set_particles_free(self, particles_idx: ti.types.ndarray(), free: ti.types.ndarray()):
         for i_p_ in range(particles_idx.shape[0]):
             i_p = particles_idx[i_p_]
             self.particles_info[i_p].free = free[i_p_]
->>>>>>> 3e24a08dd317adf5ec0c37839b325cd84d32c0c8
 
     @ti.kernel
     def _kernel_get_particles_free(self, particle_start: ti.i32, n_particles: ti.i32, free: ti.types.ndarray()):
