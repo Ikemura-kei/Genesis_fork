@@ -282,6 +282,7 @@ class MPMEntity(ParticleEntity):
             F=state.F,
             Jp=state.Jp,
             active=state.active,
+            von_mises=state.von_mises,
         )
 
         # Store all queried states to track gradient flow
