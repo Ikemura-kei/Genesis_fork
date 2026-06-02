@@ -1,5 +1,7 @@
 from io import BytesIO
 from urllib import request
+
+import DracoPy
 import numpy as np
 import pygltflib
 import trimesh
@@ -220,29 +222,30 @@ def parse_glb_material(glb, material_index, surface):
             emissive_factor = np.array(material.emissiveFactor, dtype=np.float32)
 
         emissive_texture = mu.create_texture(emissive_image, emissive_factor, "srgb")
-        if emissive_texture.is_black():  # Make sure to check emissive
+        if emissive_texture.is_black:  # Make sure to check emissive
             emissive_texture = None
 
     # TODO: Parse them!
     for extension_name, extension_material in material.extensions.items():
         if extension_name == "KHR_materials_specular":
+            # https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_specular/README.md
             specular_weight = extension_material.get("specularFactor", 1.0)
             specular_color = np.array(extension_material.get("specularColorFactor", [1.0, 1.0, 1.0]), dtype=np.float32)
-
         elif extension_name == "KHR_materials_clearcoat":
+            # https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_clearcoat/README.md
             clearcoat_weight = extension_material.get("clearcoatFactor", 0.0)
-            clearcoat_roughness_factor = extension_material["clearcoatRoughnessFactor"]
-
+            clearcoat_roughness_factor = extension_material.get("clearcoatRoughnessFactor", 0.0)
         elif extension_name == "KHR_materials_volume":
-            attenuation_distance = extension_material["attenuationDistance"]
-
+            # https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_volume/README.md
+            attenuation_distance = extension_material.get("attenuationDistance", float("inf"))
         elif extension_name == "KHR_materials_transmission":
-            specular_trans_factor = extension_material.get("transmissionFactor", 0.0)  # e.g. 1
-
+            # https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_transmission/README.md
+            specular_trans_factor = extension_material.get("transmissionFactor", 0.0)
         elif extension_name == "KHR_materials_ior":
-            ior = extension_material["ior"]  # e.g. 1.4500000476837158
+            # https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_ior/README.md
+            ior = extension_material.get("ior", 1.5)
 
-    material_surface = surface.copy()
+    material_surface = surface.model_copy()
     material_surface.update_texture(
         color_texture=color_texture,
         opacity_texture=opacity_texture,
@@ -290,7 +293,7 @@ def parse_glb_tree(glb, node_index):
     return mesh_list
 
 
-def parse_mesh_glb(path, group_by_material, scale, surface):
+def parse_mesh_glb(path, group_by_material, scale, is_mesh_zup, surface):
     glb = pygltflib.GLTF2().load(path)
     assert glb is not None
     glb.convert_images(pygltflib.ImageFormat.DATAURI)
@@ -305,6 +308,7 @@ def parse_mesh_glb(path, group_by_material, scale, surface):
 
     mesh_infos = mu.MeshInfoGroup()
     materials = {}
+    is_visual_overwritten = surface.texture is not None
 
     for i, (mesh_index, mesh_transform) in enumerate(mesh_list):
         mesh_glb = glb.meshes[mesh_index]
@@ -318,12 +322,10 @@ def parse_mesh_glb(path, group_by_material, scale, surface):
                         primitive.material, parse_glb_material(glb, primitive.material, surface)
                     )
             else:
-                material, uv_used, material_name = surface.copy(), 0, ""
+                material, uv_used, material_name = surface.model_copy(), 0, ""
 
             uvs = None
             if "KHR_draco_mesh_compression" in primitive.extensions:
-                import DracoPy
-
                 KHR_index = primitive.extensions["KHR_draco_mesh_compression"]["bufferView"]
                 mesh_buffer_view = glb.bufferViews[KHR_index]
                 mesh_data = get_glb_bufferview_data(glb, mesh_buffer_view)
@@ -332,8 +334,8 @@ def parse_mesh_glb(path, group_by_material, scale, surface):
                 )
                 points = mesh_glb.points
                 triangles = mesh_glb.faces
-                normals = mesh_glb.normals if len(mesh_glb.normals) > 0 else None
-                uvs = mesh_glb.tex_coord if len(mesh_glb.tex_coord) > 0 else None
+                normals = mesh_glb.normals if mesh_glb.normals is not None and len(mesh_glb.normals) > 0 else None
+                uvs = mesh_glb.tex_coord if mesh_glb.tex_coord is not None and len(mesh_glb.tex_coord) > 0 else None
 
             else:
                 # "primitive.attributes" records accessor indices in "glb.accessors", like:
@@ -391,8 +393,11 @@ def parse_mesh_glb(path, group_by_material, scale, surface):
             mesh_info, first_created = mesh_infos.get(group_idx)
             if first_created:
                 mesh_info.set_property(
-                    surface=material, metadata={"path": path, "name": material_name if group_by_material else mesh_name}
+                    surface=material,
+                    metadata={"mesh_path": path, "name": material_name if group_by_material else mesh_name},
                 )
             mesh_info.append(points, triangles, normals, uvs)
-
-    return mesh_infos.export_meshes(scale=scale)
+    meshes = mesh_infos.export_meshes(scale=scale, is_mesh_zup=is_mesh_zup)
+    for mesh in meshes:
+        mesh.metadata["is_visual_overwritten"] = is_visual_overwritten
+    return meshes

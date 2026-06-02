@@ -54,13 +54,17 @@ class Mesh(object):
         """(2,3) float : The axis-aligned bounds of the mesh."""
         if self._bounds is None:
             if self.primitives:
-                self._bounds = np.stack(
-                    (
-                        np.min([p.bounds[0] for p in self.primitives], axis=0),
-                        np.max([p.bounds[1] for p in self.primitives], axis=0),
-                    ),
-                    axis=0,
-                )
+                if len(self.primitives) > 1:
+                    self._bounds = np.stack(
+                        (
+                            np.min([p.bounds[0] for p in self.primitives], axis=0),
+                            np.max([p.bounds[1] for p in self.primitives], axis=0),
+                        ),
+                        axis=0,
+                    )
+                else:
+                    # In the vast majority of scenarios there is a single primitive
+                    self._bounds = self.primitives[0].bounds
             else:
                 self._bounds = np.zeros((2, 3))
         return self._bounds
@@ -265,7 +269,7 @@ class Mesh(object):
         # Process texture colors
         if mesh.visual.kind == "texture":
             # Configure UV coordinates
-            if mesh.visual.uv is not None:
+            if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals) and mesh.visual.uv is not None:
                 uv = mesh.visual.uv.copy()
                 if smooth:
                     texcoords = uv

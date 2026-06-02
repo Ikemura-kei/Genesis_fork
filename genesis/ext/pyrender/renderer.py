@@ -4,7 +4,6 @@ Author: Matthew Matl
 """
 
 import sys
-from time import time
 
 import PIL
 import pyglet
@@ -24,12 +23,15 @@ from .constants import (
     TextAlign,
 )
 from .font import FontCache
-from .jit_render import JITRenderer
 from .light import DirectionalLight, PointLight, SpotLight
 from .material import MetallicRoughnessMaterial, SpecularGlossinessMaterial
 from .shader_program import ShaderProgramCache
 from .utils import format_color_vector
 from .texture import Texture
+
+
+MARKER_XRAY_DIM_FACTOR = 0.3
+MARKER_XRAY_ALPHA = 0.4
 
 
 class Renderer(object):
@@ -141,14 +143,24 @@ class Renderer(object):
         # Update context with meshes and textures
         if is_first_pass:
             self._update_context(scene, flags)
-            self.jit.update(scene)
+            all_ready = self.jit.update(scene)
+
+            # Flush queued buffer updates AFTER jit.update(scene) so that new
+            # nodes created by set_primitive -> _add_to_context already have
+            # their GPU buffers allocated and can receive the data.
+            self.jit.flush_buffer()
+
+            if not all_ready:
+                # Shadow textures not yet initialized - skip this frame to avoid
+                # flickering. The caller should display the previous frame.
+                return ()
 
         if flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY or flags & RenderFlags.FLAT:
             flags &= ~RenderFlags.REFLECTIVE_FLOOR
 
         if flags & RenderFlags.ENV_SEPARATE and flags & RenderFlags.OFFSCREEN:
             n_envs = scene.n_envs
-            use_env_idx = True
+            use_env_idx = True and scene.n_envs > 1
         else:
             n_envs = 1
             use_env_idx = False
@@ -164,7 +176,7 @@ class Renderer(object):
                     if isinstance(ln.light, DirectionalLight) and flags & RenderFlags.SHADOWS_DIRECTIONAL:
                         take_pass = True
                     elif isinstance(ln.light, SpotLight) and flags & RenderFlags.SHADOWS_SPOT:
-                        take_pass = False
+                        take_pass = True
                     elif isinstance(ln.light, PointLight) and flags & RenderFlags.SHADOWS_POINT:
                         take_pass = True
                     if take_pass:
@@ -174,7 +186,6 @@ class Renderer(object):
                             self._shadow_mapping_pass(scene, ln, flags, env_idx=env_idx)
                         glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
-            # Make forward pass
             if flags & RenderFlags.REFLECTIVE_FLOOR:
                 self._floor_pass(scene, flags, env_idx=env_idx)
 
@@ -186,7 +197,8 @@ class Renderer(object):
                     for idx, val in enumerate(retval):
                         retval_list[idx].append(val)
 
-            # If necessary, make normals pass
+            # Render normal visualization on screen only if requested, ie after reading frame buffer and without
+            # cleaning first.
             if flags & (RenderFlags.VERTEX_NORMALS | RenderFlags.FACE_NORMALS):
                 self._normal_pass(scene, flags, env_idx=env_idx)
 
@@ -341,12 +353,6 @@ class Renderer(object):
         self._delete_shadow_framebuffer()
         self._delete_floor_framebuffer()
 
-    def __del__(self):
-        try:
-            self.delete()
-        except Exception:
-            pass
-
     ###########################################################################
     # Rendering passes
     ###########################################################################
@@ -356,9 +362,9 @@ class Renderer(object):
         glClearColor(0.0, 0.0, 0.0, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        V, P = self._get_camera_matrices(scene)
+        V, P = self._get_camera_matrices(scene, env_idx)
+        cam_pos = self._get_camera_pose(scene, env_idx)[:3, 3]
 
-        cam_pos = scene.get_pose(scene.main_camera_node)[:3, 3]
         screen_size = np.array([self.viewport_width, self.viewport_height], np.float32)
 
         self.jit.forward_pass(
@@ -393,12 +399,13 @@ class Renderer(object):
             glEnable(GL_MULTISAMPLE)
 
         # Set up camera matrices
-        V, P = self._get_camera_matrices(scene)
-        cam_pos = scene.get_pose(scene.main_camera_node)[:3, 3]
+        V, P = self._get_camera_matrices(scene, env_idx)
+        cam_pos = self._get_camera_pose(scene, env_idx)[:3, 3]
 
         floor_tex = self._floor_texture_color._texid if flags & RenderFlags.REFLECTIVE_FLOOR else 0
         screen_size = np.array([self.viewport_width, self.viewport_height], np.float32)
 
+        common_kwargs = dict(env_idx=env_idx)
         if flags & RenderFlags.SEG:
             color_list = np.zeros((len(self.jit.node_list), 3), np.float32)
             for i, node in enumerate(self.jit.node_list):
@@ -406,6 +413,37 @@ class Renderer(object):
                     color_list[i, :] = -2.0
                 else:
                     color_list[i] = seg_node_map[node] / 255.0
+            common_kwargs["color_list"] = color_list
+        else:
+            common_kwargs["floor_tex"] = floor_tex
+
+        if flags & (RenderFlags.SEG | RenderFlags.DEPTH_ONLY | RenderFlags.SKIP_MARKERS):
+            # No markers contribute to the output in these modes — single pass.
+            self.jit.forward_pass(self, V, P, cam_pos, flags, ProgramFlags.USE_MATERIAL, screen_size, **common_kwargs)
+        else:
+            # Draw non-marker geometry first so the depth buffer only contains
+            # real geometry when the x-ray pass runs. This way the GL_GREATER
+            # depth test in _marker_xray_pass cannot see marker-on-marker
+            # occlusion (e.g. dark rings at joints of chained debug cylinders)
+            # — it only ghosts markers occluded by real objects.
+            self.jit.forward_pass(
+                self,
+                V,
+                P,
+                cam_pos,
+                flags | RenderFlags.SKIP_MARKERS,
+                ProgramFlags.USE_MATERIAL,
+                screen_size,
+                **common_kwargs,
+            )
+
+            # Render occluded markers as darkened ghosts for depth cues — must
+            # happen before markers themselves are drawn so the depth buffer
+            # used for the GL_GREATER test is free of marker depths.
+            if flags & RenderFlags.MARKER_XRAY:
+                self._marker_xray_pass(V, P, cam_pos, flags, screen_size, env_idx)
+
+            # Now draw opaque markers on top
             self.jit.forward_pass(
                 self,
                 V,
@@ -414,17 +452,41 @@ class Renderer(object):
                 flags,
                 ProgramFlags.USE_MATERIAL,
                 screen_size,
-                color_list=color_list,
-                env_idx=env_idx,
-            )
-        else:
-            self.jit.forward_pass(
-                self, V, P, cam_pos, flags, ProgramFlags.USE_MATERIAL, screen_size, floor_tex=floor_tex, env_idx=env_idx
+                markers_only=True,
+                **common_kwargs,
             )
 
         # If doing offscreen render, copy result from framebuffer and return
         if flags & RenderFlags.OFFSCREEN:
             return self._read_main_framebuffer(scene, flags)
+
+    def _marker_xray_pass(self, V, P, cam_pos, flags, screen_size, env_idx):
+        """Render markers behind geometry with darkened transparency (X-ray effect)."""
+        marker_mask = self.jit.render_flags[:, 6].astype(bool)
+        if not np.any(marker_mask):
+            return
+
+        # Save and dim marker colors, force alpha blending
+        saved_pbr_mat = self.jit.pbr_mat[marker_mask].copy()
+        saved_blend_flags = self.jit.render_flags[marker_mask, 0].copy()
+        self.jit.pbr_mat[marker_mask, 0:3] *= MARKER_XRAY_DIM_FACTOR
+        self.jit.pbr_mat[marker_mask, 3] = MARKER_XRAY_ALPHA
+        self.jit.render_flags[marker_mask, 0] = 1
+
+        # Draw only occluded fragments, without touching the depth buffer.
+        glDepthFunc(GL_GREATER)
+        glDepthMask(GL_FALSE)
+
+        xray_flags = flags & ~(RenderFlags.SHADOWS_DIRECTIONAL | RenderFlags.SHADOWS_SPOT | RenderFlags.SHADOWS_POINT)
+        self.jit.forward_pass(
+            self, V, P, cam_pos, xray_flags, ProgramFlags.USE_MATERIAL, screen_size, env_idx=env_idx, markers_only=True
+        )
+
+        # Restore GL state and marker data
+        glDepthFunc(GL_LESS)
+        glDepthMask(GL_TRUE)
+        self.jit.pbr_mat[marker_mask] = saved_pbr_mat
+        self.jit.render_flags[marker_mask, 0] = saved_blend_flags
 
     def _point_shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1):
         light = light_node.light
@@ -457,7 +519,7 @@ class Renderer(object):
         program = None
 
         # Set up camera matrices
-        V, P = self._get_camera_matrices(scene)
+        V, P = self._get_camera_matrices(scene, env_idx)
 
         # Now, render each object in sorted order
         for node in scene.sorted_mesh_nodes():
@@ -692,18 +754,28 @@ class Renderer(object):
     # Camera Matrix Management
     ###########################################################################
 
-    def _get_camera_matrices(self, scene):
+    def _get_camera_matrices(self, scene, env_idx):
         main_camera_node = scene.main_camera_node
         if main_camera_node is None:
             raise ValueError("Cannot render scene without a camera")
         P = main_camera_node.camera.get_projection_matrix(width=self.viewport_width, height=self.viewport_height)
-        pose = scene.get_pose(main_camera_node)
+        pose = self._get_camera_pose(scene, env_idx)
         V = np.linalg.inv(pose)  # V maps from world to camera
         return V, P
 
+    def _get_camera_pose(self, scene, env_idx):
+        cam_pos = scene.get_pose(scene.main_camera_node)
+        if len(cam_pos.shape) == 3:
+            if cam_pos.shape[0] != 1:
+                assert env_idx != -1, "We have a multiple camera pose scene, we should be rendering per env"
+                cam_pos = cam_pos[env_idx]
+            else:
+                cam_pos = cam_pos[0]
+        return cam_pos
+
     def _get_light_cam_matrices(self, scene, light_node, flags):
         light = light_node.light
-        pose = scene.get_pose(light_node).copy()
+        pose = scene.get_pose(light_node)
         camera = light._get_shadow_camera(scene.scale)
         P = camera.get_projection_matrix()
         if isinstance(light, DirectionalLight):
@@ -1037,7 +1109,8 @@ class Renderer(object):
             glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb_ms)
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._main_fb)
             glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR)
-            glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_DEPTH_BUFFER_BIT, GL_NEAREST)
+            if flags & RenderFlags.RET_DEPTH:
+                glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_DEPTH_BUFFER_BIT, GL_NEAREST)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb)
 
         # Read depth if requested

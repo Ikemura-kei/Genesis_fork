@@ -1,49 +1,37 @@
-import hashlib
-import numbers
+import math
 import os
 import time
-from enum import Enum
+from collections import namedtuple
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
-import wandb
 
 import genesis as gs
 
 from .utils import (
-    get_hardware_fingerprint,
-    get_platform_fingerprint,
+    get_hf_dataset,
     get_git_commit_timestamp,
-    get_git_commit_info,
+    pprint_oneline,
 )
 
-
-BENCHMARK_NAME = "rigid_body"
-REPORT_FILE = "speed_test.txt"
 
 STEP_DT = 0.01
 DURATION_WARMUP = 45.0
 DURATION_RECORD = 15.0
 
+SceneMeta = namedtuple(
+    "SceneMeta",
+    ["compile_time", "step_dt", "duration_warmup", "duration_record"],
+    defaults=[STEP_DT, DURATION_WARMUP, DURATION_RECORD],
+)
+
 pytestmark = [
     pytest.mark.benchmarks,
-    pytest.mark.taichi_offline_cache(False),
+    pytest.mark.cache(False),
 ]
-
-
-def pprint_oneline(data, delimiter, digits=None):
-    msg_items = []
-    for key, value in data.items():
-        if isinstance(value, Enum):
-            value = value.name
-        if digits is not None and isinstance(value, (numbers.Real, np.floating)):
-            value = f"{value:.{digits}f}"
-        msg_item = "=".join((key, str(value)))
-        msg_items.append(msg_item)
-    return delimiter.join(msg_items)
 
 
 def get_rigid_solver_options(**kwargs):
@@ -214,9 +202,679 @@ def get_file_morph_options(**kwargs):
     return {**options, **kwargs}
 
 
+# ---------------------------------------------------------------------------
+# Scene factories
+#
+# Each factory builds a complete scene and returns (scene, step_fn, metadata).
+#   - scene:    the built gs.Scene (useful for visualization, inspection)
+#   - step_fn:  callable that runs one simulation step including control logic
+#   - metadata: dict with compile_time, step_dt, and optional overrides for
+#               duration_warmup, duration_record
+#
+# **scene_kwargs are forwarded to gs.Scene(), allowing callers to control
+# show_viewer, vis_options, etc. without modifying these factories.
+# ---------------------------------------------------------------------------
+
+
+def make_go2(n_envs, solver=None, gjk=None, **scene_kwargs):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **get_rigid_solver_options(
+                dt=STEP_DT,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            )
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    robot = scene.add_entity(
+        gs.morphs.URDF(file="urdf/go2/urdf/go2.urdf"),
+        vis_mode="collision",
+    )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    ctrl_pos = torch.tensor(
+        [0.0, 0.0, 0.0, 0.0, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5],
+        dtype=gs.tc_float,
+        device=gs.device,
+    )
+    robot.control_dofs_position(ctrl_pos, dofs_idx_local=slice(6, None))
+
+    init_qpos = torch.tensor(
+        [[0.0, 0.0, 0.42, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]],
+        dtype=gs.tc_float,
+        device=gs.device,
+    ).repeat((scene.n_envs, 1))
+    dofs_lower_bound, dofs_upper_bound = robot.get_dofs_limit()
+    init_qpos[:, 7:] = dofs_lower_bound[6:] + (dofs_upper_bound[6:] - dofs_lower_bound[6:]) * torch.rand(
+        (scene.n_envs, robot.n_dofs - 6), dtype=gs.tc_float, device=gs.device
+    )
+    robot.set_qpos(init_qpos)
+
+    def step():
+        scene.step()
+
+    return scene, step, SceneMeta(compile_time=compile_time)
+
+
+def make_anymal(n_envs, solver=None, gjk=None, control=None, with_kinematic=False, **scene_kwargs):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **get_rigid_solver_options(
+                dt=STEP_DT,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            )
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    robot = scene.add_entity(
+        gs.morphs.URDF(
+            **get_file_morph_options(
+                file="urdf/anymal_c/urdf/anymal_c.urdf",
+                pos=(0, 0, 0.8),
+            )
+        ),
+    )
+    ghost = None
+    if with_kinematic:
+        ghost = scene.add_entity(
+            gs.morphs.URDF(file="urdf/anymal_c/urdf/anymal_c.urdf", pos=(0, -0.5, 0.8)),
+            material=gs.materials.Kinematic(),
+        )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    motors_dof_idx = slice(6, None)
+    robot.set_dofs_kp(1000.0, motors_dof_idx)
+    robot.control_dofs_position(0.0, motors_dof_idx)
+
+    if control == "uniform":
+        rand_shape = (12,)
+    elif control == "per_env":
+        rand_shape = (n_envs, 12)
+    else:
+        rand_shape = None
+
+    def step():
+        if rand_shape is not None:
+            robot.control_dofs_position(
+                torch.rand(rand_shape, dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, motors_dof_idx
+            )
+        if ghost is not None:
+            ghost.set_dofs_position(
+                torch.rand(rand_shape, dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, motors_dof_idx
+            )
+        scene.step()
+
+    return scene, step, SceneMeta(compile_time=compile_time)
+
+
+def make_franka(
+    n_envs, solver=None, gjk=None, is_collision_free=False, is_randomized=False, accessors=False, **scene_kwargs
+):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **get_rigid_solver_options(
+                dt=STEP_DT,
+                enable_neutral_collision=True,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            )
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    franka = scene.add_entity(
+        gs.morphs.MJCF(
+            **get_file_morph_options(
+                file="xml/franka_emika_panda/panda.xml",
+            )
+        ),
+    )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    qpos0 = torch.tensor([0, 0, 0, -1.0, 0, 1.0, 0, 0.02, 0.02], dtype=gs.tc_float, device=gs.device)
+    if n_envs > 0:
+        qpos0 = torch.tile(qpos0, (n_envs, 1))
+    if is_collision_free:
+        franka.set_qpos(qpos0)
+        franka.control_dofs_position(qpos0)
+
+    if n_envs > 0 and is_randomized:
+        vel0 = 0.2 * torch.clip(torch.randn((n_envs, franka.n_dofs), dtype=gs.tc_float, device=gs.device), -1.0, 1.0)
+        vel0[:, [link.dof_start for link in franka.links if not link.name.startswith("link") and link.n_dofs]] = 0.0
+    else:
+        vel0 = torch.zeros((*((n_envs,) if n_envs > 0 else ()), franka.n_dofs), dtype=gs.tc_float, device=gs.device)
+    franka.set_dofs_velocity(vel0)
+
+    # scene.rigid_solver._queried_states.clear()
+    # state_0 = scene.get_state()
+    state_rigid_0 = scene.rigid_solver.get_state()
+
+    if n_envs > 0:
+        n_reset_envs = max(int(0.02 * n_envs), 1)
+        reset_envs_idx = torch.randperm(n_envs, dtype=gs.tc_int, device=gs.device)[:n_reset_envs]
+        reset_envs_mask = torch.isin(scene._envs_idx, reset_envs_idx)
+    else:
+        reset_envs_mask = None
+
+    dofs_stiffness = franka.get_dofs_stiffness()
+    dofs_damping = franka.get_dofs_damping()
+
+    def step():
+        scene.step()
+        if accessors:
+            franka.get_ang()
+            franka.get_vel()
+            franka.get_dofs_position()
+            franka.get_dofs_velocity()
+            franka.get_links_pos()
+            franka.get_links_quat()
+            franka.get_links_vel()
+            franka.get_contacts()
+
+            # TODO: Entire scene reset is still slow currently because 'partial=False' by default.
+            scene.rigid_solver.set_state(0, state_rigid_0, envs_idx=reset_envs_mask, partial=True)
+
+            franka.control_dofs_position(qpos0)
+            franka.set_dofs_stiffness(dofs_stiffness)
+            franka.set_dofs_damping(dofs_damping)
+            franka.set_dofs_velocity(vel0, envs_idx=reset_envs_mask, skip_forward=True)
+            franka.set_qpos(qpos0, envs_idx=reset_envs_mask, zero_velocity=False, skip_forward=True)
+
+    return scene, step, SceneMeta(compile_time=compile_time)
+
+
+def make_duck_in_box(n_envs, solver=None, gjk=None, hard=False, **scene_kwargs):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/tank.obj",
+            scale=5.0,
+            pos=(0.0, 0.0, 0.0),
+            euler=(90, 0, 90),
+            fixed=True,
+        ),
+        vis_mode="collision",
+    )
+    if hard:
+        mesh_kwargs = dict(
+            pos=(0.0, 0.0, 0.035),
+        )
+    else:
+        mesh_kwargs = dict(
+            pos=(0.1, 0.1, 0.035),
+            decompose_object_error_threshold=float("inf"),
+        )
+    duck = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file="meshes/duck.obj",
+            scale=0.04,
+            euler=(90, 0, 90),
+            **mesh_kwargs,
+        ),
+    )
+
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    if n_envs > 0:
+        duck.set_dofs_velocity(0.5 * torch.rand((n_envs, 6), dtype=gs.tc_float, device=gs.device))
+
+    def step():
+        scene.step()
+
+    return scene, step, SceneMeta(compile_time=compile_time)
+
+
+def make_box_pyramid(n_envs, solver=None, gjk=None, n_cubes=3, **scene_kwargs):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **get_rigid_solver_options(
+                dt=STEP_DT,
+                tolerance=1e-5,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            )
+        ),
+        **{
+            "viewer_options": gs.options.ViewerOptions(
+                camera_pos=(0.0, -3.5, 2.5),
+                camera_lookat=(0.0, 0.0, 0.5),
+                camera_fov=30,
+                max_FPS=60,
+            ),
+            "show_viewer": False,
+            "show_FPS": False,
+            **scene_kwargs,
+        },
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    box_size = 0.25
+    box_spacing = (1.0 - 1e-3) * box_size
+    box_pos_offset = (-0.5, 1.0, 0.0) + 0.5 * np.array([box_size, box_size, box_size])
+    for i in range(n_cubes):
+        for j in range(n_cubes - i):
+            scene.add_entity(
+                gs.morphs.Box(
+                    size=[box_size, box_size, box_size],
+                    pos=box_pos_offset + box_spacing * np.array([i + 0.5 * j, 0.0, j]),
+                ),
+            )
+
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    if n_envs > 0:
+        for box in scene.entities[1:]:
+            box.set_dofs_velocity(0.04 * torch.rand((n_envs, 6), dtype=gs.tc_float, device=gs.device))
+
+    def step():
+        scene.step()
+
+    return scene, step, SceneMeta(compile_time=compile_time)
+
+
+def make_g1_fall(n_envs, solver=None, gjk=None, **scene_kwargs):
+    step_dt = 0.005
+
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            dt=step_dt,
+            iterations=10,
+            tolerance=1e-5,
+            ls_iterations=20,
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    asset_path = get_hf_dataset(pattern="unitree_g1/*")
+    robot = scene.add_entity(
+        gs.morphs.MJCF(
+            **get_file_morph_options(
+                file=f"{asset_path}/unitree_g1/g1_29dof_rev_1_0.xml",
+                pos=(0, 0, 1.0),
+            )
+        ),
+        vis_mode="collision",
+    )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    init_qpos = torch.zeros((robot.n_qs,), dtype=gs.tc_float, device=gs.device)
+    init_qpos[2] = 1.0  # z position
+    init_qpos[3] = 1.0  # quaternion w component
+    robot.set_qpos(init_qpos)
+
+    random_forces = torch.zeros((n_envs, robot.n_dofs), dtype=gs.tc_float, device=gs.device)
+    max_force = 50.0
+
+    def step():
+        random_forces.uniform_(-max_force, max_force)
+        robot.control_dofs_force(random_forces)
+        scene.step()
+
+    return (
+        scene,
+        step,
+        SceneMeta(
+            compile_time=compile_time,
+            step_dt=step_dt,
+            duration_warmup=20.0,
+            duration_record=5.0,
+        ),
+    )
+
+
+def make_double_smplx(n_envs, solver=None, gjk=None, **scene_kwargs):
+    # Two 159-DOF SMPL-X humanoids dropped on a plane with random per-DOF torques: the 318-DOF environment exceeds the
+    # constraint-Hessian shared-memory cap and each entity exceeds the per-entity mass-matrix cap, so both
+    # factorizations exercise their uncapped paths.
+    STEP_DT = 0.005
+    INIT_POSS = ((0.0, -0.5, 1.4), (0.0, 0.5, 1.4))  # pelvis dropped 1.4 m above the plane, offset in y
+    INIT_EULER = (90.0, 0.0, 0.0)  # SMPL-X canonical frame is Y-up; rotate to stand upright in Genesis (Z-up)
+    MAX_FORCE = 500.0
+
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            dt=STEP_DT,
+            # Cap the reserved contacts so the self-colliding 318-DOF Jacobian (n_constraints * n_dofs * n_envs) stays
+            # within int32 at n_envs=4096.
+            max_collision_pairs=40,
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    asset_path = get_hf_dataset(pattern="smplx_humanoid/*")
+    smplx_xml = f"{asset_path}/smplx_humanoid/smplx_humanoid.xml"
+    robots = [
+        scene.add_entity(
+            gs.morphs.MJCF(
+                **get_file_morph_options(
+                    file=smplx_xml,
+                    pos=pos,
+                    euler=INIT_EULER,
+                )
+            ),
+            vis_mode="collision",
+        )
+        for pos in INIT_POSS
+    ]
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    random_forces = [torch.zeros((n_envs, robot.n_dofs), dtype=gs.tc_float, device=gs.device) for robot in robots]
+
+    def step():
+        for robot, forces in zip(robots, random_forces):
+            forces.uniform_(-MAX_FORCE, MAX_FORCE)
+            robot.control_dofs_force(forces)
+        scene.step()
+
+    return (
+        scene,
+        step,
+        SceneMeta(
+            compile_time=compile_time,
+            step_dt=STEP_DT,
+            duration_warmup=20.0,
+            duration_record=5.0,
+        ),
+    )
+
+
+def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, **scene_kwargs):
+    _STEP_DT = 1.0 / 30
+    TABLE_Z = 0.762
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=_STEP_DT, substeps=4, gravity=(0, 0, -9.81)),
+        rigid_options=gs.options.RigidOptions(
+            noslip_iterations=2,
+            max_collision_pairs=256,
+            sparse_solve=sparse_solve,
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    # Two shadow hands placed horizontally, palms facing down
+    scene.add_entity(
+        morph=gs.morphs.URDF(
+            file="urdf/shadow_hand/shadow_hand.urdf",
+            pos=(-0.1, 0.30, 0.9 * TABLE_Z),
+            euler=(90, 0, 0),
+            fixed=True,
+        )
+    )
+    scene.add_entity(
+        morph=gs.morphs.URDF(
+            file="urdf/shadow_hand/shadow_hand.urdf",
+            pos=(0.1, 0.30, 0.9 * TABLE_Z),
+            euler=(90, 0, 0),
+            fixed=True,
+        )
+    )
+
+    # Table
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0, 0, TABLE_Z / 2),
+            size=(0.5, 0.5, TABLE_Z / 2),
+            fixed=True,
+        )
+    )
+
+    # 25 cubes in a 5x5 grid on the table
+    for i in range(25):
+        x = -0.10 + 0.05 * (i % 5)
+        y = -0.05 + 0.05 * (i // 5)
+        scene.add_entity(
+            material=gs.materials.Rigid(friction=0.8),
+            morph=gs.morphs.Box(
+                pos=(x, y, TABLE_Z + 0.01),
+                size=(0.02, 0.02, 0.02),
+            ),
+        )
+
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    def step():
+        scene.step()
+
+    return (
+        scene,
+        step,
+        SceneMeta(
+            compile_time=compile_time,
+            step_dt=_STEP_DT,
+            duration_warmup=20.0,
+            duration_record=5.0,
+        ),
+    )
+
+
+def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
+    shadow_hand_path = Path(get_hf_dataset(pattern="shadow_hand/*"))
+    dex_path = Path(get_hf_dataset(pattern="dex/*"))
+
+    WRIST_STIFFNESS = 20
+    FINGER_FORCE = 0.6
+    DRILL_STIFFNESS = 20
+
+    _STEP_DT = 1 / 16
+
+    JOINT_NAMES = [
+        *("FFJ4", "FFJ3", "FFJ2", "FFJ1"),
+        *("MFJ4", "MFJ3", "MFJ2", "MFJ1"),
+        *("RFJ4", "RFJ3", "RFJ2", "RFJ1"),
+        *("LFJ5", "LFJ4", "LFJ3", "LFJ2", "LFJ1"),
+        *("THJ5", "THJ4", "THJ3", "THJ2", "THJ1"),
+    ]
+    LEFT_DOFS = [
+        *(0.34907, 0.24929, 0.54424, 0.65614),
+        *(0.21329, 0.08060, 0.19969, 0.66944),
+        *(1.57080, 0.21846, 0.53605, 0.44963),
+        *(0.38350, 0.02379, 0.41705, 0.54773, 0.61160),
+        *(0.36664, 0.44036, 0.20944, 0.34497, 0.15896),
+    ]
+    RIGHT_DOFS = [
+        *(0.34907, 0.23328, 0.57399, 0.70467),
+        *(0.00000, 0.34907, 0.51778, 0.65078),
+        *(1.48947, 0.33727, 0.55919, 0.56268),
+        *(0.54360, -0.08460, 0.48588, 0.66095, 0.73317),
+        *(0.13239, 0.45613, 0.20944, 0.19625, 0.00750),
+    ]
+
+    hand_configs = [
+        dict(
+            pos=(0.19227, -0.00058, 1.31227),
+            quat=(-0.45215, -0.31265, 0.76087, 0.34480),
+            dofs=LEFT_DOFS,
+            urdf="shadow_hand_left_woarm.urdf",
+        ),
+        dict(
+            pos=(0.16257, 0.24658, 1.28047),
+            quat=(0.74525, 0.46466, -0.45186, -0.15660),
+            dofs=RIGHT_DOFS,
+            urdf="shadow_hand_right_woarm.urdf",
+        ),
+    ]
+
+    # Note: screenshots on effect of coacd_options on how the drill and table look
+    # at https://github.com/Genesis-Embodied-AI/Genesis/pull/2500#discussion_r2900243286
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=_STEP_DT,
+            substeps=25,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            max_collision_pairs=200,
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
+    )
+
+    hands = []
+    for cfg in hand_configs:
+        urdf_path = str(shadow_hand_path / "shadow_hand" / cfg["urdf"])
+        hand = scene.add_entity(
+            gs.morphs.URDF(file=urdf_path, pos=cfg["pos"], quat=cfg["quat"]),
+        )
+        hands.append(hand)
+
+    table_path = str(dex_path / "dex" / "table.glb")
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file=table_path,
+            pos=(0.1, 0.0, 0.485403),
+            euler=(0, 0, 90),
+            fixed=True,
+        )
+    )
+    drill_path = str(dex_path / "dex" / "drill_1.glb")
+    drill = scene.add_entity(
+        gs.morphs.Mesh(
+            file=drill_path,
+            pos=(0.15, 0.1, 0.87),
+            euler=(90, 0, 225),
+        )
+    )
+
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    for hand, default_dof in zip(hands, (LEFT_DOFS, RIGHT_DOFS)):
+        kp = [WRIST_STIFFNESS] * 6 + [40.0] * (hand.n_dofs - 6)
+        hand.set_dofs_kp(kp)
+        hand.set_dofs_kv(2.0 * np.sqrt(kp))
+        hand.set_dofs_position(
+            default_dof,
+            dofs_idx_local=[hand.get_joint(name).dofs_idx_local[0] for name in JOINT_NAMES],
+        )
+        hand.control_dofs_position(torch.clamp(hand.get_dofs_position(), *hand.get_dofs_limit()))
+
+    finger_dofs = {hand: slice(6, hand.n_dofs) for hand in hands}
+    random_forces = {
+        hand: torch.zeros((n_envs, hand.n_dofs - 6), dtype=gs.tc_float, device=gs.device) for hand in hands
+    }
+    base_xy_targets = {hand: hand.get_dofs_position()[:, :2] for hand in hands}
+
+    drill.set_dofs_kp(DRILL_STIFFNESS, dofs_idx_local=[0, 1])
+    drill.set_dofs_kv(2.0 * math.sqrt(DRILL_STIFFNESS), dofs_idx_local=[0, 1])
+    drill_xy_target = drill.get_dofs_position()[:, :2]
+
+    for hand in hands:
+        hand.control_dofs_position(base_xy_targets[hand], dofs_idx_local=[0, 1])
+    drill.control_dofs_position(drill_xy_target, dofs_idx_local=[0, 1])
+
+    def step():
+        for hand in hands:
+            random_forces[hand].uniform_(-FINGER_FORCE, FINGER_FORCE)
+            hand.control_dofs_force(random_forces[hand], dofs_idx_local=finger_dofs[hand])
+        scene.step()
+
+    return (
+        scene,
+        step,
+        SceneMeta(
+            compile_time=compile_time,
+            step_dt=_STEP_DT,
+            duration_warmup=20.0,
+            duration_record=5.0,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+
+
+def run_benchmark(step_fn, *, n_envs, meta):
+    import quadrants as qd
+
+    qd.sync()
+
+    # Force CUDA-context init / lazy module load / first kernel SASS JIT to
+    # complete BEFORE entering the wall-clock warmup loop. Otherwise, the
+    # warmup's `meta.duration_warmup` budget can be partially consumed by
+    # CUDA setup (which happens on the first kernel launch into a fresh
+    # context) instead of by actual step()s. When that happens, the wall-
+    # clock warmup ends before the per-process cold-start phase (~5 s of
+    # slow step()s on hardware tested) is over, and the recording window
+    # then measures cold-start step time instead of steady-state — which
+    # manifested as intermittent 50%+ apparent `runtime_fps` regressions in
+    # `g1_fall` cluster benchmark runs even though steady-state step() time
+    # was unchanged. After this single sync-bracketed step the warmup loop's
+    # wall-clock budget contains only step() execution time, so 20 s of
+    # warmup actually means 20 s of step()s — enough to absorb the cold-
+    # start phase on every benchmark. Cost: 1 step() + 1 qd.sync().
+    step_fn()
+    qd.sync()
+
+    num_steps = 0
+    is_recording = False
+    time_start = time.time()
+    while True:
+        step_fn()
+        time_elapsed = time.time() - time_start
+        if is_recording:
+            num_steps += 1
+            if time_elapsed > meta.duration_record:
+                qd.sync()
+                time_elapsed = time.time() - time_start
+                break
+        elif time_elapsed > meta.duration_warmup:
+            qd.sync()
+            time_start = time.time()
+            is_recording = True
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
+    realtime_factor = runtime_fps * meta.step_dt
+
+    return dict(compile_time=meta.compile_time, runtime_fps=runtime_fps, realtime_factor=realtime_factor)
+
+
+# ---------------------------------------------------------------------------
+# Pytest infrastructure
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="session")
-def stream_writers(backend, printer_session):
-    report_path = Path(REPORT_FILE)
+def stream_writers(printer_session, request):
+    report_path = Path(request.config.getoption("--speed-test-filepath"))
 
     # Delete old unrelated worker-specific reports
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
@@ -245,75 +903,26 @@ def stream_writers(backend, printer_session):
 def factory_logger(stream_writers):
     class Logger:
         def __init__(self, hparams: dict[str, Any]):
-            self.hparams = hparams
-            self.benchmark_id = "-".join((BENCHMARK_NAME, pprint_oneline(hparams, delimiter="-")))
-
-            self.logger = None
-            self.wandb_run = None
+            self.hparams = {
+                **hparams,
+                "dtype": "ndarray" if gs.use_ndarray else "field",
+                "backend": str(gs.backend.name),
+            }
 
         def __enter__(self):
-            nonlocal stream_writers
-
-            if "WANDB_API_KEY" in os.environ:
-                assert gs.backend is not None
-                revision, timestamp = get_git_commit_info()
-
-                hardware_fringerprint = get_hardware_fingerprint(include_gpu=(gs.backend != gs.cpu))
-                platform_fringerprint = get_platform_fingerprint()
-                machine_uuid = hashlib.md5(
-                    "-".join((hardware_fringerprint, platform_fringerprint)).encode("UTF-8")
-                ).hexdigest()
-
-                benchmark_uuid = hashlib.md5(self.benchmark_id.encode("UTF-8")).hexdigest()
-
-                run_uuid = hashlib.md5(
-                    "-".join((hardware_fringerprint, platform_fringerprint, self.benchmark_id, revision)).encode(
-                        "UTF-8"
-                    )
-                ).hexdigest()
-
-                self.wandb_run = wandb.init(
-                    project="genesis-benchmarks",
-                    name="-".join((self.benchmark_id, revision)),
-                    id=run_uuid,
-                    tags=[BENCHMARK_NAME, benchmark_uuid],
-                    config={
-                        "revision": revision,
-                        "timestamp": timestamp,
-                        "machine_uuid": machine_uuid,
-                        "hardware": hardware_fringerprint,
-                        "platform": platform_fringerprint,
-                        "backend": str(gs.backend.name),
-                        "benchmark_id": self.benchmark_id,
-                        **self.hparams,
-                    },
-                    settings=wandb.Settings(
-                        x_disable_stats=True,
-                        console="off",
-                    ),
-                )
             return self
 
         def __exit__(self, exc_type, exc_value, traceback):
-            if self.wandb_run is not None:
-                self.wandb_run.finish()
+            pass
 
         def write(self, items):
             nonlocal stream_writers
-
-            if self.wandb_run is not None:
-                self.wandb_run.log(
-                    {
-                        "timestamp": self.wandb_run.config["timestamp"],
-                        **items,
-                    }
-                )
 
             if stream_writers:
                 msg = (
                     pprint_oneline(self.hparams, delimiter=" \t| ")
                     + " \t| "
-                    + pprint_oneline(items, delimiter=" \t| ", digits=0)
+                    + pprint_oneline(items, delimiter=" \t| ", digits=1)
                 )
                 for writer in stream_writers:
                     writer(msg)
@@ -321,366 +930,182 @@ def factory_logger(stream_writers):
     return Logger
 
 
-@pytest.fixture
-def anymal_c(solver, n_envs, gjk):
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-    robot = scene.add_entity(
-        gs.morphs.URDF(
-            **get_file_morph_options(
-                file="urdf/anymal_c/urdf/anymal_c.urdf",
-                pos=(0, 0, 0.8),
-            )
-        ),
-    )
-    time_start = time.time()
-    scene.build(n_envs=n_envs)
-    compile_time = time.time() - time_start
-
-    joints_name = (
-        "RH_HAA",
-        "LH_HAA",
-        "RF_HAA",
-        "LF_HAA",
-        "RH_HFE",
-        "LH_HFE",
-        "RF_HFE",
-        "LF_HFE",
-        "RH_KFE",
-        "LH_KFE",
-        "RF_KFE",
-        "LF_KFE",
-    )
-    motors_dof_idx = [robot.get_joint(name).dof_start for name in joints_name]
-    robot.set_dofs_kp(np.full(12, 1000), motors_dof_idx)
-    if n_envs > 0:
-        robot.control_dofs_position(np.zeros((n_envs, 12)), motors_dof_idx)
-    else:
-        robot.control_dofs_position(np.zeros(12), motors_dof_idx)
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+# ---------------------------------------------------------------------------
+# Pytest fixture wrappers (thin: just wire factory -> runner)
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def batched_franka(solver, n_envs, gjk):
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-    scene.add_entity(
-        gs.morphs.MJCF(
-            **get_file_morph_options(
-                file="xml/franka_emika_panda/panda.xml",
-            )
-        ),
-        visualize_contact=True,
-    )
-    time_start = time.time()
-    scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
-    compile_time = time.time() - time_start
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+def go2(solver, n_envs, gjk):
+    _, step_fn, meta = make_go2(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def random(solver, n_envs, gjk):
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-    robot = scene.add_entity(
-        gs.morphs.URDF(
-            **get_file_morph_options(
-                file="urdf/anymal_c/urdf/anymal_c.urdf",
-                pos=(0, 0, 0.8),
-            )
-        ),
-        visualize_contact=True,
-    )
-    time_start = time.time()
-    scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
-    compile_time = time.time() - time_start
-
-    robot.set_dofs_kp(np.full((12,), fill_value=1000.0), np.arange(6, 18))
-    dofs = torch.arange(6, 18, device=gs.device)
-    robot.control_dofs_position(torch.zeros((n_envs, 12), device=gs.device), dofs)
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        robot.control_dofs_position(
-            torch.as_tensor(np.random.rand(n_envs, 12), dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, dofs
-        )
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+def anymal_zero(solver, n_envs, gjk):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control=None)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def cubes(solver, n_envs, n_cubes, enable_island, gjk):
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                use_contact_island=enable_island,
-                use_gjk_collision=gjk,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-    for i in range(n_cubes):
-        scene.add_entity(
-            gs.morphs.Box(
-                size=(0.1, 0.1, 0.1),
-                pos=(0.0, 0.2 * i, 0.045),
-            ),
-        )
-    time_start = time.time()
-    scene.build(n_envs=n_envs)
-    compile_time = time.time() - time_start
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+def anymal_uniform(solver, n_envs, gjk):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="uniform")
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def box_pyramid(solver, n_envs, n_cubes, enable_island, gjk, enable_mujoco_compatibility):
-    x_pos = 0.0
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                use_contact_island=enable_island,
-                use_gjk_collision=gjk,
-                box_box_detection=False,
-                enable_mujoco_compatibility=enable_mujoco_compatibility,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(x_pos, -3.5, 2.5),
-            camera_lookat=(x_pos, 0.0, 0.5),
-            camera_fov=30,
-            max_FPS=60,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane(pos=(x_pos, 0, 0)))
-    # create pyramid of boxes
-    box_size = 0.25
-    box_spacing = box_size
-    vec_one = np.array([1.0, 1.0, 1.0])
-    box_pos_offset = (x_pos - 0.5, 1, 0.0) + 0.5 * box_size * vec_one
-    for i in range(n_cubes):
-        for j in range(n_cubes - i):
-            scene.add_entity(
-                gs.morphs.Box(
-                    size=box_size * vec_one,
-                    pos=box_pos_offset + box_spacing * np.array([i + 0.5 * j, 0.0, j]),
-                ),
-            )
-
-    time_start = time.time()
-    scene.build(n_envs=n_envs)
-    compile_time = time.time() - time_start
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+def anymal_random(solver, n_envs, gjk):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="per_env")
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
-@pytest.mark.parametrize("runnable", ["anymal_c", "batched_franka"])
-@pytest.mark.parametrize("solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
-@pytest.mark.parametrize("n_envs", [30000])
-@pytest.mark.parametrize("gjk", [False, True])
-def test_speed(factory_logger, request, runnable, solver, n_envs, gjk):
+@pytest.fixture
+def anymal_uniform_kinematic(solver, n_envs, gjk):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="uniform", with_kinematic=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def franka(solver, n_envs, gjk):
+    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def franka_random(solver, n_envs, gjk):
+    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_randomized=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def franka_free(solver, n_envs, gjk):
+    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_collision_free=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def franka_accessors(solver, n_envs, gjk):
+    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_collision_free=True, accessors=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def duck_in_box_easy(solver, n_envs, gjk):
+    _, step_fn, meta = make_duck_in_box(n_envs, solver=solver, gjk=gjk, hard=False)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def duck_in_box_hard(solver, n_envs, gjk):
+    _, step_fn, meta = make_duck_in_box(n_envs, solver=solver, gjk=gjk, hard=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_3(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=3)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_4(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=4)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_5(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=5)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_6(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=6)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def g1_fall(solver, n_envs, gjk):
+    _, step_fn, meta = make_g1_fall(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def double_smplx(solver, n_envs, gjk):
+    _, step_fn, meta = make_double_smplx(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def shadow_hand_cubes(solver, n_envs, gjk):
+    _, step_fn, meta = make_shadow_hand_cubes(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def shadow_hand_cubes_sparse(solver, n_envs, gjk):
+    _, step_fn, meta = make_shadow_hand_cubes(n_envs, solver=solver, gjk=gjk, sparse_solve=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def dex_hand(solver, n_envs, gjk):
+    _, step_fn, meta = make_dex_hand(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Parametrized benchmark test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "runnable, solver, gjk, n_envs, backend",
+    [
+        ("duck_in_box_easy", None, True, 30000, gs.gpu),
+        ("duck_in_box_easy", None, False, 30000, gs.gpu),
+        ("duck_in_box_hard", None, True, 30000, gs.gpu),
+        ("duck_in_box_hard", None, False, 30000, gs.gpu),
+        ("duck_in_box_hard", None, None, 0, gs.cpu),
+        ("anymal_random", None, None, 30000, gs.gpu),
+        ("anymal_uniform", None, None, 30000, gs.gpu),
+        ("anymal_zero", None, None, 30000, gs.gpu),
+        ("anymal_zero", None, None, 0, gs.cpu),
+        ("anymal_uniform_kinematic", None, None, 30000, gs.gpu),
+        ("anymal_uniform_kinematic", None, None, 0, gs.cpu),
+        ("go2", None, True, 4096, gs.gpu),
+        ("go2", gs.constraint_solver.CG, False, 4096, gs.gpu),
+        ("go2", gs.constraint_solver.Newton, False, 4096, gs.gpu),
+        ("franka_accessors", None, None, 0, gs.cpu),
+        ("franka_accessors", None, None, 30000, gs.gpu),
+        ("franka_free", None, None, 30000, gs.gpu),
+        ("franka", None, None, 30000, gs.gpu),
+        ("franka_random", None, False, 30000, gs.gpu),
+        ("franka_random", None, True, 30000, gs.gpu),
+        ("franka_random", gs.constraint_solver.CG, None, 30000, gs.gpu),
+        ("franka_random", gs.constraint_solver.Newton, None, 30000, gs.gpu),
+        ("franka_random", None, None, 0, gs.cpu),
+        ("box_pyramid_3", None, None, 4096, gs.gpu),
+        ("box_pyramid_4", None, None, 4096, gs.gpu),
+        ("box_pyramid_5", None, None, 4096, gs.gpu),
+        ("box_pyramid_6", None, True, 4096, gs.gpu),
+        ("box_pyramid_6", None, False, 4096, gs.gpu),
+        ("g1_fall", gs.constraint_solver.Newton, None, 4096, gs.gpu),
+        ("double_smplx", gs.constraint_solver.Newton, None, 4096, gs.gpu),
+        ("shadow_hand_cubes", None, None, 0, gs.cpu),
+        ("shadow_hand_cubes_sparse", None, None, 0, gs.cpu),
+        ("dex_hand", None, None, 4096, gs.gpu),
+    ],
+)
+def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):
     with factory_logger(
         {
             "env": runnable,
             "batch_size": n_envs,
-            "constraint_solver": solver,
+            **({"constraint_solver": solver} if solver is not None else {}),
             "use_contact_island": False,
-            "gjk_collision": gjk,
+            **({"gjk_collision": gjk} if gjk is not None else {}),
         }
     ) as logger:
         logger.write(request.getfixturevalue(runnable))
-
-
-@pytest.mark.parametrize("solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
-@pytest.mark.parametrize("n_cubes", [10])
-# Will skipt constraint_solver_decomp_island.py and migrate this file later.
-# Right now, island is kind of outdated, including those equality constraints.
-# @pytest.mark.parametrize("enable_island", [False, True])
-@pytest.mark.parametrize("enable_island", [False])
-@pytest.mark.parametrize("n_envs", [8192])
-@pytest.mark.parametrize("gjk", [False, True])
-def test_cubes(factory_logger, request, n_cubes, solver, enable_island, n_envs, gjk):
-    with factory_logger(
-        {
-            "env": f"cube#{n_cubes}",
-            "batch_size": n_envs,
-            "constraint_solver": solver,
-            "use_contact_island": enable_island,
-            "gjk_collision": gjk,
-        }
-    ) as logger:
-        logger.write(request.getfixturevalue("cubes"))
-
-
-# FIXME:Increasing the batch size triggers CUDA out-of-memory error (Nvidia H100)
-# FIXME:Increasing # cubes triggers CUDA illegal memory access error for all collision methods (Nvidia RTX 5900)
-@pytest.mark.parametrize("solver", [gs.constraint_solver.Newton])
-@pytest.mark.parametrize("n_cubes", [5])
-@pytest.mark.parametrize("enable_island", [False])
-@pytest.mark.parametrize("n_envs", [2048])
-@pytest.mark.parametrize(
-    "gjk, enable_mujoco_compatibility",
-    [
-        (False, True),  # MPR
-        (False, False),  # MPR+SDF
-        (True, False),  # GJK
-    ],
-)
-def test_box_pyramid(factory_logger, request, n_cubes, solver, enable_island, n_envs, gjk, enable_mujoco_compatibility):
-    with factory_logger(
-        {
-            "env": f"box_pyramid#{n_cubes}",
-            "batch_size": n_envs,
-            "constraint_solver": solver,
-            "use_contact_island": enable_island,
-            "gjk_collision": gjk,
-            "enable_mujoco_compatibility": enable_mujoco_compatibility,
-        }
-    ) as logger:
-        logger.write(request.getfixturevalue("box_pyramid"))

@@ -4,17 +4,18 @@ import copy
 import os
 import shutil
 import sys
-import time
 import threading
+import time
+from contextlib import nullcontext
 from threading import Event, RLock, Semaphore, Thread
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-import imageio
 import numpy as np
 import OpenGL
 from OpenGL.GL import *
 
 import genesis as gs
+from genesis.vis.keybindings import Key, KeyAction, Keybind, Keybindings, KeyMod
 
 # Importing tkinter and creating a first context before importing pyglet is necessary to avoid later segfault on MacOS.
 # Note that destroying the window will cause segfault at exit.
@@ -31,11 +32,16 @@ if sys.platform.startswith("darwin"):
 
 import pyglet
 
+from genesis.vis.viewer_plugins import EVENT_HANDLE_STATE, EVENT_HANDLED, ViewerPlugin
+
 from .camera import IntrinsicsCamera, OrthographicCamera, PerspectiveCamera
 from .constants import (
     DEFAULT_SCENE_SCALE,
     DEFAULT_Z_FAR,
     DEFAULT_Z_NEAR,
+    FONT_COLOR_DARKMODE,
+    FONT_COLOR_LIGHTMODE,
+    FONT_SIZE,
     MIN_OPEN_GL_MAJOR,
     MIN_OPEN_GL_MINOR,
     TARGET_OPEN_GL_MAJOR,
@@ -44,22 +50,24 @@ from .constants import (
     RenderFlags,
     TextAlign,
 )
-from .interaction.viewer_interaction import ViewerInteraction
-from .interaction.viewer_interaction_base import ViewerInteractionBase, EVENT_HANDLE_STATE, EVENT_HANDLED
 from .light import DirectionalLight
 from .node import Node
 from .renderer import Renderer
-from .shader_program import ShaderProgram, ShaderProgramCache
+from .shader_program import ShaderProgram
 from .trackball import Trackball
 
 if TYPE_CHECKING:
     from genesis.vis.rasterizer_context import RasterizerContext
 
+MODULE_DIR = os.path.dirname(__file__)
+
+HELP_TEXT_KEY = Key.I
+HELP_TEXT_KEYBIND_NAME = "toggle_instructions"
+
 
 pyglet.options["shadow_window"] = False
-
-
-MODULE_DIR = os.path.dirname(__file__)
+if pyglet.options.get("dpi_scaling") != "real":
+    pyglet.options["dpi_scaling"] = "real"
 
 
 class Viewer(pyglet.window.Window):
@@ -80,17 +88,7 @@ class Viewer(pyglet.window.Window):
     viewer_flags : dict
         A set of flags for controlling the viewer's behavior.
         Described in the note below.
-    registered_keys : dict
-        A map from ASCII key characters to tuples containing:
-
-        - A function to be called whenever the key is pressed,
-          whose first argument will be the viewer itself.
-        - (Optionally) A list of additional positional arguments
-          to be passed to the function.
-        - (Optionally) A dict of keyword arguments to be passed
-          to the function.
-
-    kwargs : dict
+    **kwargs : dict
         Any keyword arguments left over will be interpreted as belonging to
         either the :attr:`.Viewer.render_flags` or :attr:`.Viewer.viewer_flags`
         dictionaries. Those flag sets will be updated appropriately.
@@ -111,25 +109,9 @@ class Viewer(pyglet.window.Window):
       - Scroll the mouse wheel, or
       - Hold the right mouse button and drag the cursor.
 
-    Other keyboard commands are as follows:
-
-    - ``a``: Toggles rotational animation mode.
-    - ``c``: Toggles backface culling.
-    - ``f``: Toggles fullscreen mode.
-    - ``h``: Toggles shadow rendering.
-    - ``i``: Toggles axis display mode.
-    - ``l``: Toggles lighting mode
-      (scene lighting, Raymond lighting, or direct lighting).
-    - ``m``: Toggles face normal visualization.
-    - ``n``: Toggles vertex normal visualization.
-    - ``o``: Toggles orthographic mode.
-    - ``q``: Quits the viewer.
-    - ``r``: Starts recording a GIF, and pressing again stops recording
-      and opens a file dialog.
-    - ``s``: Opens a file dialog to save the current view as an image.
-    - ``w``: Toggles wireframe mode
-      (scene default, flip wireframes, all wireframe, or all solid).
-    - ``z``: Resets the camera to the initial view.
+    Keyboard shortcuts are registered by ``DefaultControlsPlugin`` (see
+    ``genesis/vis/viewer_plugins/plugins/default_controls.py``) and surfaced in the on-screen help overlay; press the
+    help key to toggle it.
 
     Note
     ----
@@ -199,13 +181,13 @@ class Viewer(pyglet.window.Window):
         viewport_size=None,
         render_flags=None,
         viewer_flags=None,
-        registered_keys=None,
         run_in_thread=False,
         auto_start=True,
         shadow=False,
         plane_reflection=False,
         env_separate_rigid=False,
-        enable_interaction=False,
+        plugins=None,
+        enable_help_text=True,
         **kwargs,
     ):
         #######################################################################
@@ -215,10 +197,12 @@ class Viewer(pyglet.window.Window):
             viewport_size = (640, 480)
         self.gs_context = context
         self._scene = context._scene
+        # ``_viewport_size`` tracks the current window content area and follows ``on_resize`` (the OS may
+        # clamp the window to a smaller area than requested); ``_offscreen_viewport_size`` keeps the size the
+        # caller asked for so the offscreen renderer can always honor it regardless of window clamping.
         self._viewport_size = viewport_size
+        self._offscreen_viewport_size = viewport_size
         self._render_lock = RLock()
-        self._offscreen_result_semaphore = Semaphore(0)
-        self._offscreen_event = Event()
         self._initialized_event = Event()
         self._is_active = False
         self._exception = None
@@ -226,7 +210,13 @@ class Viewer(pyglet.window.Window):
         self._run_in_thread = run_in_thread
         self._seg_node_map = context.seg_node_map
 
-        self._video_saver = None
+        self._offscreen_event = Event()
+        self._offscreen_pending_render = None
+        self._offscreen_pending_close = None
+        self._offscreen_semaphore = Semaphore(0)
+        self._offscreen_result = None
+
+        self._video_recorder = None
 
         self._default_render_flags = {
             "flip_wireframe": False,
@@ -276,38 +266,12 @@ class Viewer(pyglet.window.Window):
             elif key in self.viewer_flags:
                 self._viewer_flags[key] = kwargs[key]
 
-        self._registered_keys = {}
-        if registered_keys is not None:
-            self._registered_keys = {ord(k.lower()): registered_keys[k] for k in registered_keys}
+        self._keybindings: Keybindings = Keybindings()
+        self._held_keys: dict[tuple[int, int], bool] = {}
 
         #######################################################################
         # Save internal settings
         #######################################################################
-
-        # Set up caption stuff
-        self._message_text = None
-        self._ticks_till_fade = 2.0 / 3.0 * self.viewer_flags["refresh_rate"]
-        self._message_opac = 1.0 + self._ticks_till_fade
-
-        self._display_instr = False
-        self._instr_texts = [
-            ["> [i]: show keyboard instructions"],
-            [
-                "< [i]: hide keyboard instructions",
-                "     [r]: record video",
-                "     [s]: save image",
-                "     [z]: reset camera",
-                "     [a]: camera rotation",
-                "     [h]: shadow",
-                "     [f]: face normal",
-                "     [v]: vertex normal",
-                "     [w]: world frame",
-                "     [l]: link frame",
-                "     [d]: wireframe",
-                "     [c]: camera & frustrum",
-                "   [F11]: full-screen mode",
-            ],
-        ]
 
         # Set up raymond lights and direct lights
         self._raymond_lights = self._create_raymond_lights()
@@ -316,80 +280,43 @@ class Viewer(pyglet.window.Window):
         #######################################################################
         # Set up camera node
         #######################################################################
-        self._camera_node = None
-        self._prior_main_camera_node = None
-        self._default_camera_pose = None
-        self._default_persp_cam = None
-        self._default_orth_cam = None
-        self._trackball = None
+        self._setup_main_camera()
 
-        # Extract main camera from scene and set up our mirrored copy
-        znear = None
-        zfar = None
-        if self.scene.main_camera_node is not None:
-            n = self.scene.main_camera_node
-            camera = copy.copy(n.camera)
-            if isinstance(camera, (PerspectiveCamera, IntrinsicsCamera)):
-                self._default_persp_cam = camera
-                znear = camera.znear
-                zfar = camera.zfar
-            elif isinstance(camera, OrthographicCamera):
-                self._default_orth_cam = camera
-                znear = camera.znear
-                zfar = camera.zfar
-            self._default_camera_pose = self.scene.get_pose(self.scene.main_camera_node)
-            self._prior_main_camera_node = n
+        # Setup help text functionality
+        is_dark_mode = np.mean(context.background_color[0:3]) < 0.5
+        self._font_color = FONT_COLOR_DARKMODE if is_dark_mode else FONT_COLOR_LIGHTMODE
+        self._enable_help_text = enable_help_text
+        if self._enable_help_text:
+            self._collapse_instructions = True
+            instr_key_str = str(Key(HELP_TEXT_KEY))
+            self._instr_texts: tuple[list[str], list[str]] = (
+                [f"> [{instr_key_str}]: show keyboard instructions"],
+                [f"< [{instr_key_str}]: hide keyboard instructions"],
+            )
+            self._key_instr_texts: list[str] = []
+            self._message_text = None
+            self._ticks_till_fade = 2.0 / 3.0 * self.viewer_flags["refresh_rate"]
+            self._message_opac = 1.0 + self._ticks_till_fade
+            self.register_keybinds(
+                Keybind(
+                    HELP_TEXT_KEYBIND_NAME,
+                    HELP_TEXT_KEY,
+                    callback=self._toggle_instructions,
+                    protected=True,
+                    allow_overload=True,
+                )
+            )
 
-        # Set defaults as needed
-        if zfar is None:
-            zfar = max(self.scene.scale * 10.0, DEFAULT_Z_FAR)
-        if znear is None or znear < 1e-6:
-            if self.scene.scale < 1e-6:
-                znear = DEFAULT_Z_NEAR
-            else:
-                znear = min(self.scene.scale / 10.0, DEFAULT_Z_NEAR)
-
-        if self._default_persp_cam is None:
-            self._default_persp_cam = PerspectiveCamera(yfov=np.pi / 3.0, znear=znear, zfar=zfar)
-        if self._default_orth_cam is None:
-            xmag = ymag = self.scene.scale
-            if self.scene.scale < 1e-6:
-                xmag = ymag = 1.0
-            self._default_orth_cam = OrthographicCamera(xmag=xmag, ymag=ymag, znear=znear, zfar=zfar)
-        if self._default_camera_pose is None:
-            self._default_camera_pose = self._compute_initial_camera_pose()
-
-        # Pick camera
-        if self.viewer_flags["use_perspective_cam"]:
-            camera = self._default_persp_cam
-        else:
-            camera = self._default_orth_cam
-
-        self._camera_node = Node(matrix=self._default_camera_pose, camera=camera)
-        self.scene.add_node(self._camera_node)
-        self.scene.main_camera_node = self._camera_node
-        self._reset_view()
-
-        # Setup mouse interaction
-
-        # Note: context.scene is genesis.engine.scene.Scene
-        # Note: context._scene is genesis.ext.pyrender.scene.Scene
-        self.viewer_interaction = (
-            ViewerInteraction(self._camera_node, context.scene, viewport_size, camera.yfov)
-            if enable_interaction
-            else ViewerInteractionBase()
-        )
+        # Setup viewer plugins
+        self.plugins: list[ViewerPlugin] = []
+        for plugin in plugins:
+            self.register_plugin(plugin)
 
         #######################################################################
         # Initialize OpenGL context and renderer
         #######################################################################
-        self._renderer = Renderer(
-            self._viewport_size[0], self._viewport_size[1], context.jit, self.render_flags["point_size"]
-        )
+        self._renderer = Renderer(*self._viewport_size, context.jit, self.render_flags["point_size"])
         self._is_active = True
-
-        self.pending_offscreen_camera = None
-        self.offscreen_result = None
 
         # Starting the viewer would raise an exception if the OpenGL context is invalid for some reason. This exception
         # must be caught in order to implement some fallback mechanism. One may want to start the viewer from the main
@@ -404,9 +331,8 @@ class Viewer(pyglet.window.Window):
             self._initialized_event.wait()
             if not self._is_active:
                 if self._exception:
-                    raise self._exception
-                # Just to be extra careful, this fallback should never be triggered in practice.
-                raise OpenGL.error.Error("Invalid OpenGL context.")
+                    raise RuntimeError("Unable to initialize an OpenGL 3+ context.") from self._exception
+                raise OpenGL.error.Error("Invalid OpenGL context (unknown exception).")
         else:
             if self.auto_start:
                 self.start()
@@ -438,7 +364,7 @@ class Viewer(pyglet.window.Window):
         """bool : `True` if the viewer is active, or `False` if it has
         been closed.
         """
-        return self._is_active
+        return self._is_active and (not self._run_in_thread or self._thread.is_alive())
 
     @property
     def run_in_thread(self):
@@ -516,25 +442,147 @@ class Viewer(pyglet.window.Window):
     def viewer_flags(self, value):
         self._viewer_flags = value
 
-    @property
-    def registered_keys(self):
-        """dict : Map from ASCII key character to a handler function.
+    def _setup_main_camera(self):
+        # Extract main camera from the current scene and set up our mirrored copy. Re-runnable so a rebind
+        # to a rebuilt scene graph re-creates the camera node on the new scene.
+        self._camera_node = None
+        self._prior_main_camera_node = None
+        self._default_camera_pose = None
+        self._default_persp_cam = None
+        self._default_orth_cam = None
+        self._trackball = None
 
-        This is a map from ASCII key characters to tuples containing:
+        znear = None
+        zfar = None
+        if self.scene.main_camera_node is not None:
+            n = self.scene.main_camera_node
+            camera = copy.copy(n.camera)
+            if isinstance(camera, (PerspectiveCamera, IntrinsicsCamera)):
+                self._default_persp_cam = camera
+                znear = camera.znear
+                zfar = camera.zfar
+            elif isinstance(camera, OrthographicCamera):
+                self._default_orth_cam = camera
+                znear = camera.znear
+                zfar = camera.zfar
+            self._default_camera_pose = self.scene.get_pose(self.scene.main_camera_node)
+            self._prior_main_camera_node = n
 
-        - A function to be called whenever the key is pressed,
-          whose first argument will be the viewer itself.
-        - (Optionally) A list of additional positional arguments
-          to be passed to the function.
-        - (Optionally) A dict of keyword arguments to be passed
-          to the function.
+        # Set defaults as needed
+        if zfar is None:
+            zfar = max(self.scene.scale * 10.0, DEFAULT_Z_FAR)
+        if znear is None or znear < 1e-6:
+            if self.scene.scale < 1e-6:
+                znear = DEFAULT_Z_NEAR
+            else:
+                znear = min(self.scene.scale / 10.0, DEFAULT_Z_NEAR)
 
+        if self._default_persp_cam is None:
+            self._default_persp_cam = PerspectiveCamera(yfov=np.pi / 3.0, znear=znear, zfar=zfar)
+        if self._default_orth_cam is None:
+            xmag = ymag = self.scene.scale
+            if self.scene.scale < 1e-6:
+                xmag = ymag = 1.0
+            self._default_orth_cam = OrthographicCamera(xmag=xmag, ymag=ymag, znear=znear, zfar=zfar)
+        self._orth_cam_reset_mags = (self._default_orth_cam.xmag, self._default_orth_cam.ymag)
+        if self._default_camera_pose is None:
+            self._default_camera_pose = self._compute_initial_camera_pose()
+
+        # Pick camera
+        if self.viewer_flags["use_perspective_cam"]:
+            camera = self._default_persp_cam
+        else:
+            camera = self._default_orth_cam
+
+        self._camera_node = Node(matrix=self._default_camera_pose, camera=camera)
+        self.scene.add_node(self._camera_node)
+        self.scene.main_camera_node = self._camera_node
+        self._reset_view()
+
+    def rebind(self, context, plugins):
+        """Re-point this live viewer/window at a rebuilt scene graph (InteractiveScene rebuild) instead of
+        opening a new window. Reuses the OS window and GL context, refreshing the context-bound state:
+        scene graph, segmentation map, renderer, camera node and plugins. Rough on purpose - assumes no
+        concurrent render thread is touching the old scene during the rebuild."""
+        with self._render_lock:
+            self.gs_context = context
+            self._scene = context._scene
+            self._seg_node_map = context.seg_node_map
+            if self._renderer is not None:
+                self._renderer.delete()
+            self._renderer = Renderer(*self._viewport_size, context.jit, self.render_flags["point_size"])
+            self._setup_main_camera()
+            self.plugins = []
+            for plugin in plugins:
+                self.register_plugin(plugin)
+
+    def register_plugin(self, plugin: ViewerPlugin) -> None:
         """
-        return self._registered_keys
+        Register a viewer plugin.
 
-    @registered_keys.setter
-    def registered_keys(self, value):
-        self._registered_keys = value
+        Parameters
+        ----------
+        plugin : :class:`.ViewerPlugin`
+            The viewer plugin to add.
+        """
+        self.plugins.append(plugin)
+        plugin.build(self, self._camera_node, self.gs_context.scene)
+        # Register pyglet.window event handlers from the plugin
+        self.push_handlers(plugin)
+
+    def register_keybinds(self, /, *keybinds: Keybind, overwrite: bool = False) -> None:
+        """
+        Add a key handler to call a function when the given key is pressed.
+
+        Parameters
+        ----------
+        keybinds : Keybind
+            One or more Keybind objects to register.
+        """
+        for keybind in keybinds:
+            self._keybindings.register(keybind, overwrite)
+        self._update_instr_texts()
+
+    def remap_keybind(
+        self,
+        keybind_name: str,
+        new_key_code: Key,
+        new_key_mods: tuple[KeyMod] | None,
+        new_key_action: KeyAction = KeyAction.PRESS,
+    ) -> None:
+        """
+        Remap an existing keybind to a new key combination.
+
+        Parameters
+        ----------
+        keybind_name : str
+            The name of the keybind to remap.
+        new_key_code : int
+            The new key code from pyglet.
+        new_key_mods : tuple[KeyMod] | None
+            The new modifier keys pressed.
+        new_key_action : KeyAction, optional
+            The new type of key action. If not provided, the key action of the old keybind is used.
+        """
+        self._keybindings.rebind(
+            keybind_name,
+            new_key_code,
+            new_key_mods,
+            new_key_action,
+        )
+        self._update_instr_texts()
+
+    def remove_keybind(self, keybind_name: str) -> None:
+        """
+        Remove an existing keybind.
+
+        Parameters
+        ----------
+        keybind_name : str
+            The name of the keybind to remove.
+        """
+        self._keybindings.remove(keybind_name)
+        self._update_instr_texts()
 
     def close(self):
         """Close the viewer.
@@ -568,13 +616,13 @@ class Viewer(pyglet.window.Window):
             a file dialog will be opened to ask the user where
             to save the video file.
         """
-        self.video_recorder.close()
+        self._video_recorder.close()
         if filename is None:
             filename = self._get_save_filename(["mp4"])
         if filename is None:
-            os.remove(self.video_recorder.filename)
+            os.remove(self._video_recorder.filename)
         else:
-            shutil.move(self.video_recorder.filename, filename)
+            shutil.move(self._video_recorder.filename, filename)
 
     def on_close(self):
         """Exit the event loop when the window is closed."""
@@ -584,6 +632,9 @@ class Viewer(pyglet.window.Window):
 
         # Do not consider the viewer as active anymore
         self._is_active = False
+
+        for plugin in self.plugins:
+            plugin.on_close()
 
         # Remove our camera and restore the prior one
         try:
@@ -613,121 +664,144 @@ class Viewer(pyglet.window.Window):
                 pass
         self._renderer = None
 
+        # Delete video recorder
+        if self.viewer_flags["record"]:
+            self._video_recorder.close()
+            os.remove(self._video_recorder.filename)
+
         # Force clean-up of OpenGL context data
         try:
             OpenGL.contextdata.cleanupContext()
             super().close()
         except Exception:
             pass
-        finally:
+        try:
             super().on_close()
-            try:
-                pyglet.app.exit()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        try:
+            pyglet.app.exit()
+        except Exception:
+            pass
+        try:
+            pyglet.app.platform_event_loop.stop()
+        except Exception:
+            pass
 
-        self._offscreen_result_semaphore.release()
+        self._offscreen_semaphore.release()
 
-    def render_offscreen(self, camera_node, render_target, rgb=True, depth=False, seg=False, normal=False):
+    def close_offscreen(self, render_target):
+        if not self.is_active:
+            return
+
+        self._offscreen_pending_close = (render_target,)
+        if self._run_in_thread:
+            # Send offscreen request
+            self._offscreen_event.set()
+            # Wait for offscreen
+            self._offscreen_semaphore.acquire()
+        else:
+            # Force close renderer synchronously
+            self._event_loop_step_offscreen()
+
+    def render_offscreen(
+        self,
+        camera_node,
+        render_target,
+        rgb=True,
+        depth=False,
+        seg=False,
+        normal=False,
+        skip_markers=False,
+        env_separate_rigid=None,
+    ):
+        if not self.is_active:
+            gs.raise_exception("Viewer already closed.")
+
         if rgb and seg:
             gs.raise_exception("RGB and segmentation map cannot be rendered in the same forward pass.")
         self.render_flags["rgb"] = rgb
         self.render_flags["seg"] = seg
         self.render_flags["depth"] = depth
-        self.pending_offscreen_camera = (camera_node, render_target, normal)
+        saved_env_separate_rigid = self.render_flags["env_separate_rigid"]
+        if env_separate_rigid is not None:
+            self.render_flags["env_separate_rigid"] = env_separate_rigid
+        self._offscreen_pending_render = (camera_node, render_target, normal, skip_markers)
         if self._run_in_thread:
-            # send_offscreen_request
+            # Send offscreen request
             self._offscreen_event.set()
-            # wait_for_offscreen
-            self._offscreen_result_semaphore.acquire()
+            # Wait for offscreen
+            self._offscreen_semaphore.acquire()
         else:
             # Force offscreen rendering synchronously
-            self.draw_offscreen()
+            self._event_loop_step_offscreen()
         self.render_flags["rgb"] = True
         self.render_flags["seg"] = False
         self.render_flags["depth"] = False
-        return self.offscreen_result
+        self.render_flags["env_separate_rigid"] = saved_env_separate_rigid
+        return self._offscreen_result
 
     def wait_until_initialized(self):
         self._initialized_event.wait()
 
-    def draw_offscreen(self):
-        if self.pending_offscreen_camera is None:
+    def _event_loop_step_offscreen(self):
+        if self._offscreen_pending_render is None and self._offscreen_pending_close is None:
             return
 
-        if self._run_in_thread:
-            self.render_lock.acquire()
+        with self.render_lock if self._run_in_thread else nullcontext():
+            # Make OpenGL context current
+            self.switch_to()
 
-        # Make OpenGL context current
-        self.switch_to()
+            if self._offscreen_pending_close is not None:
+                # Extract request right away
+                (target,) = self._offscreen_pending_close
+                self._offscreen_pending_close = None
 
-        # Update the context if not already done before
-        self._renderer.jit.update_buffer(self.gs_context.buffer)
-        self.gs_context.buffer.clear()
+                # Delete renderer.
+                # Note that it must be done here, because calling this method involve OpenGL routines that cannot cross
+                # thread boundaries, otherwise it will cause segmentation fault.
+                target.delete()
 
-        self.offscreen_results = []
-        self.render_flags["offscreen"] = True
-        camera, target, normal = self.pending_offscreen_camera
-        self.clear()
-        retval = self._render(camera, target, normal)
-        self.offscreen_result = retval if retval else (None, None)
-        self.pending_offscreen_camera = None
-        self.render_flags["offscreen"] = False
-        self._offscreen_result_semaphore.release()
+            if self._offscreen_pending_render is not None:
+                # Extract request right away
+                camera, target, normal, skip_markers = self._offscreen_pending_render
+                self._offscreen_pending_render = None
 
-        if self._run_in_thread:
-            self.render_lock.release()
+                # Update context, just in case is not already done before
+                self.gs_context.update()
+
+                # Render current frame from camera viewpoint. Force the renderer back to the originally
+                # requested viewport size so the offscreen FBO honors what the caller asked for even when the
+                # window has since been clamped to a smaller content area by the OS (e.g. macOS CI runners).
+                self._offscreen_results = []
+                self.render_flags["offscreen"] = True
+                self.render_flags["skip_markers"] = skip_markers
+                saved_viewport = (target.viewport_width, target.viewport_height)
+                target.viewport_width, target.viewport_height = self._offscreen_viewport_size
+                try:
+                    self.clear()
+                    retval = self._render(camera, target, normal)
+                finally:
+                    target.viewport_width, target.viewport_height = saved_viewport
+                self._offscreen_result = retval if retval else (None, None)
+                self.render_flags["offscreen"] = False
+                self.render_flags["skip_markers"] = False
+
+            if self._run_in_thread:
+                self._offscreen_semaphore.release()
 
     def on_draw(self):
         """Redraw the scene into the viewing window."""
         if self._renderer is None:
             return
 
-        if self._run_in_thread or not self.auto_start:
-            self.render_lock.acquire()
+        with self.render_lock if self._run_in_thread or not self.auto_start else nullcontext():
+            # Make OpenGL context current
+            self.switch_to()
 
-        # Make OpenGL context current
-        self.switch_to()
-
-        # Update the context if not already done before
-        self._renderer.jit.update_buffer(self.gs_context.buffer)
-        self.gs_context.buffer.clear()
-
-        # Render the scene
-        self.clear()
-        self._render()
-
-        self.viewer_interaction.on_draw()
-
-        if not self._initialized_event.is_set():
-            self._initialized_event.set()
-
-        if self._display_instr:
-            self._renderer.render_texts(
-                self._instr_texts[1],
-                TEXT_PADDING,
-                self.viewport_size[1] - TEXT_PADDING,
-                font_pt=26,
-                color=np.array([1.0, 1.0, 1.0, 0.85]),
-            )
-        else:
-            self._renderer.render_texts(
-                self._instr_texts[0],
-                TEXT_PADDING,
-                self.viewport_size[1] - TEXT_PADDING,
-                font_pt=26,
-                color=np.array([1.0, 1.0, 1.0, 0.85]),
-            )
-
-        if self._message_text is not None:
-            self._renderer.render_text(
-                self._message_text,
-                self.viewport_size[0] - TEXT_PADDING,
-                TEXT_PADDING,
-                font_pt=20,
-                color=np.array([0.1, 0.7, 0.2, np.clip(self._message_opac, 0.0, 1.0)]),
-                align=TextAlign.BOTTOM_RIGHT,
-            )
+            # Render the scene
+            self.clear()
+            self._render()
 
         if self.viewer_flags["caption"] is not None:
             for caption in self.viewer_flags["caption"]:
@@ -743,8 +817,11 @@ class Viewer(pyglet.window.Window):
                     align=caption["location"],
                 )
 
-        if self._run_in_thread or not self.auto_start:
-            self.render_lock.release()
+        # Render help text
+        self._render_help_text()
+
+        for plugin in self.plugins:
+            plugin.on_draw()
 
     def on_resize(self, width: int, height: int) -> EVENT_HANDLE_STATE:
         """Resize the camera and trackball when the window is resized."""
@@ -756,17 +833,19 @@ class Viewer(pyglet.window.Window):
 
         self._viewport_size = (width, height)
         self._trackball.resize(self._viewport_size)
-        self._renderer.viewport_width = self._viewport_size[0]
-        self._renderer.viewport_height = self._viewport_size[1]
-        self.viewer_interaction.on_resize(width, height)
+        self._renderer.viewport_width = width
+        self._renderer.viewport_height = height
         self.on_draw()
 
     def on_mouse_motion(self, x: int, y: int, dx: int, dy: int) -> EVENT_HANDLE_STATE:
         """The mouse was moved with no buttons held down."""
-        return self.viewer_interaction.on_mouse_motion(x, y, dx, dy)
+        pass
 
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record an initial mouse press."""
+        # Stop animating while using the mouse
+        self.viewer_flags["mouse_pressed"] = True
+
         self._trackball.set_state(Trackball.STATE_ROTATE)
         if button == pyglet.window.mouse.LEFT:
             ctrl = modifiers & pyglet.window.key.MOD_CTRL
@@ -783,34 +862,28 @@ class Viewer(pyglet.window.Window):
 
         self._trackball.down(np.array([x, y]))
 
-        # Stop animating while using the mouse
-        self.viewer_flags["mouse_pressed"] = True
-        return self.viewer_interaction.on_mouse_press(x, y, button, modifiers)
+        return EVENT_HANDLED
 
     def on_mouse_drag(self, x: int, y: int, dx: int, dy: int, buttons: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """The mouse was moved with one or more buttons held down."""
-        result = self.viewer_interaction.on_mouse_drag(x, y, dx, dy, buttons, modifiers)
-        if result is not EVENT_HANDLED:
-            result = self._trackball.drag(np.array([x, y]))
+        result = self._trackball.drag(np.array([x, y]))
         return result
 
     def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record a mouse release."""
         self.viewer_flags["mouse_pressed"] = False
-        return self.viewer_interaction.on_mouse_release(x, y, button, modifiers)
+        return EVENT_HANDLED
 
-    def on_mouse_scroll(self, x, y, dx, dy):
+    def on_mouse_scroll(self, x, y, dx, dy) -> EVENT_HANDLE_STATE:
         """Record a mouse scroll."""
         if self.viewer_flags["use_perspective_cam"]:
             self._trackball.scroll(dy)
         else:
             spfc = 0.95
-            spbc = 1.0 / 0.95
-            sf = 1.0
-            if dy > 0:
-                sf = spfc * dy
-            elif dy < 0:
-                sf = -spbc * dy
+            dy_f = float(dy)
+            if abs(dy_f) < 1e-8:
+                return EVENT_HANDLED
+            sf = float(spfc**dy_f)
 
             c = self._camera_node.camera
             xmag = max(c.xmag * sf, 1e-8)
@@ -818,172 +891,30 @@ class Viewer(pyglet.window.Window):
             c.xmag = xmag
             c.ymag = ymag
 
+        return EVENT_HANDLED
+
+    def _call_keybind_callback(self, symbol: int, modifiers: int, action: KeyAction) -> None:
+        """Call registered keybind callbacks for the given key event."""
+        keybind: Keybind = self._keybindings.get(symbol, modifiers, action)
+        if keybind is not None and keybind.callback is not None:
+            keybind.callback(*keybind.args, **keybind.kwargs)
+
     def on_key_press(self, symbol: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record a key press."""
-        # First, check for registered key callbacks
-        if symbol in self.registered_keys:
-            tup = self.registered_keys[symbol]
-            callback = None
-            args = []
-            kwargs = {}
-            if not isinstance(tup, (list, tuple, np.ndarray)):
-                callback = tup
-            else:
-                callback = tup[0]
-                if len(tup) == 2:
-                    args = tup[1]
-                if len(tup) == 3:
-                    kwargs = tup[2]
-            callback(self, *args, **kwargs)
-            return self.viewer_interaction.on_key_press(symbol, modifiers)
+        if (symbol, modifiers) not in self._held_keys:
+            self._call_keybind_callback(symbol, modifiers, KeyAction.PRESS)
 
-        # Otherwise, use default key functions
-
-        # A causes the frame to rotate
-        self._message_text = None
-        if symbol == pyglet.window.key.A:
-            self.viewer_flags["rotate"] = not self.viewer_flags["rotate"]
-            if self.viewer_flags["rotate"]:
-                self._message_text = "Rotation On"
-            else:
-                self._message_text = "Rotation Off"
-
-        # F11 toggles face normals
-        elif symbol == pyglet.window.key.F11:
-            self.viewer_flags["fullscreen"] = not self.viewer_flags["fullscreen"]
-            self.set_fullscreen(self.viewer_flags["fullscreen"])
-            self.activate()
-            if self.viewer_flags["fullscreen"]:
-                self._message_text = "Fullscreen On"
-            else:
-                self._message_text = "Fullscreen Off"
-
-        # H toggles shadows
-        elif symbol == pyglet.window.key.H:
-            self.render_flags["shadows"] = not self.render_flags["shadows"]
-            if self.render_flags["shadows"]:
-                self._message_text = "Shadows On"
-            else:
-                self._message_text = "Shadows Off"
-
-        # W toggles world frame
-        elif symbol == pyglet.window.key.W:
-            if not self.gs_context.world_frame_shown:
-                self.gs_context.on_world_frame()
-                self._message_text = "World Frame On"
-            else:
-                self.gs_context.off_world_frame()
-                self._message_text = "World Frame Off"
-
-        # L toggles link frame
-        elif symbol == pyglet.window.key.L:
-            if not self.gs_context.link_frame_shown:
-                self.gs_context.on_link_frame()
-                self._message_text = "Link Frame On"
-            else:
-                self.gs_context.off_link_frame()
-                self._message_text = "Link Frame Off"
-
-        # C toggles camera frustum
-        elif symbol == pyglet.window.key.C:
-            if not self.gs_context.camera_frustum_shown:
-                self.gs_context.on_camera_frustum()
-                self._message_text = "Camera Frustrum On"
-            else:
-                self.gs_context.off_camera_frustum()
-                self._message_text = "Camera Frustrum Off"
-
-        # F toggles face normals
-        elif symbol == pyglet.window.key.F:
-            self.render_flags["face_normals"] = not self.render_flags["face_normals"]
-            if self.render_flags["face_normals"]:
-                self._message_text = "Face Normals On"
-            else:
-                self._message_text = "Face Normals Off"
-
-        # V toggles vertex normals
-        elif symbol == pyglet.window.key.V:
-            self.render_flags["vertex_normals"] = not self.render_flags["vertex_normals"]
-            if self.render_flags["vertex_normals"]:
-                self._message_text = "Vert Normals On"
-            else:
-                self._message_text = "Vert Normals Off"
-
-        # R starts recording frames
-        elif symbol == pyglet.window.key.R:
-            if self.viewer_flags["record"]:
-                self.save_video()
-                self.set_caption(self.viewer_flags["window_title"])
-            else:
-                # Importing moviepy is very slow and not used very often. Let's delay import.
-                from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
-
-                self.video_recorder = FFMPEG_VideoWriter(
-                    filename=os.path.join(gs.utils.misc.get_cache_dir(), "tmp_video.mp4"),
-                    fps=self.viewer_flags["refresh_rate"],
-                    size=self.viewport_size,
-                )
-                self.set_caption("{} (RECORDING)".format(self.viewer_flags["window_title"]))
-            self.viewer_flags["record"] = not self.viewer_flags["record"]
-
-        # S saves the current frame as an image
-        elif symbol == pyglet.window.key.S:
-            self._save_image()
-
-        # T toggles through geom types
-        # elif symbol == pyglet.window.key.T:
-        #     if self.gs_context.rigid_shown == 'visual':
-        #         self.gs_context.on_rigid('collision')
-        #         self._message_text = "Geom Type: 'collision'"
-        #     elif self.gs_context.rigid_shown == 'collision':
-        #         self.gs_context.on_rigid('sdf')
-        #         self._message_text = "Geom Type: 'sdf'"
-        #     else:
-        #         self.gs_context.on_rigid('visual')
-        #         self._message_text = "Geom Type: 'visual'"
-
-        # D toggles through wireframe modes
-        elif symbol == pyglet.window.key.D:
-            if self.render_flags["flip_wireframe"]:
-                self.render_flags["flip_wireframe"] = False
-                self.render_flags["all_wireframe"] = True
-                self.render_flags["all_solid"] = False
-                self._message_text = "All Wireframe"
-            elif self.render_flags["all_wireframe"]:
-                self.render_flags["flip_wireframe"] = False
-                self.render_flags["all_wireframe"] = False
-                self.render_flags["all_solid"] = True
-                self._message_text = "All Solid"
-            elif self.render_flags["all_solid"]:
-                self.render_flags["flip_wireframe"] = False
-                self.render_flags["all_wireframe"] = False
-                self.render_flags["all_solid"] = False
-                self._message_text = "Default Wireframe"
-            else:
-                self.render_flags["flip_wireframe"] = True
-                self.render_flags["all_wireframe"] = False
-                self.render_flags["all_solid"] = False
-                self._message_text = "Flip Wireframe"
-
-        # Z resets the camera viewpoint
-        elif symbol == pyglet.window.key.Z:
-            self._reset_view()
-
-        # i toggles instruction display
-        elif symbol == pyglet.window.key.I:
-            self._display_instr = not self._display_instr
-
-        elif symbol == pyglet.window.key.P:
-            self._renderer.reload_program()
-
-        if self._message_text is not None:
-            self._message_opac = 1.0 + self._ticks_till_fade
-
-        return self.viewer_interaction.on_key_press(symbol, modifiers)
+        self._held_keys[(symbol, modifiers)] = True
 
     def on_key_release(self, symbol: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record a key release."""
-        return self.viewer_interaction.on_key_release(symbol, modifiers)
+        self._held_keys.pop((symbol, modifiers), None)
+
+        self._call_keybind_callback(symbol, modifiers, KeyAction.RELEASE)
+
+    def on_deactivate(self) -> EVENT_HANDLE_STATE:
+        """Clear held keys when window loses focus."""
+        self._held_keys.clear()
 
     @staticmethod
     def _time_event(dt, self):
@@ -997,26 +928,6 @@ class Viewer(pyglet.window.Window):
         if self.viewer_flags["rotate"] and not self.viewer_flags["mouse_pressed"]:
             self._rotate()
 
-        # Manage message opacity
-        if self._message_text is not None:
-            if self._message_opac > 1.0:
-                self._message_opac -= 1.0
-            else:
-                self._message_opac *= 0.90
-            if self._message_opac < 0.05:
-                self._message_opac = 1.0 + self._ticks_till_fade
-                self._message_text = None
-
-        # video saving warning
-        if self._video_saver is not None:
-            if self._video_saver.is_alive():
-                self._message_text = "Saving video... Please don't exit."
-                self._message_opac = 1.0
-            else:
-                self._message_text = f"Video saved to {self._video_file_name}"
-                self._message_opac = self.viewer_flags["refresh_rate"] * 2
-                self._video_saver = None
-
         self.on_draw()
 
     def _reset_view(self):
@@ -1025,9 +936,6 @@ class Viewer(pyglet.window.Window):
         The view is initially along the positive x-axis at a
         sufficient distance from the scene.
         """
-        # scale = self.scene.scale
-        # if scale == 0.0:
-        #     scale = DEFAULT_SCENE_SCALE
         scale = DEFAULT_SCENE_SCALE
         centroid = self.scene.centroid
 
@@ -1035,6 +943,8 @@ class Viewer(pyglet.window.Window):
             centroid = self.viewer_flags["view_center"]
 
         self._camera_node.matrix = self._default_camera_pose
+        oc = self._default_orth_cam
+        oc.xmag, oc.ymag = self._orth_cam_reset_mags
         self._trackball = Trackball(self._default_camera_pose, self.viewport_size, scale, centroid)
 
     def _get_save_filename(self, file_exts):
@@ -1054,14 +964,14 @@ class Viewer(pyglet.window.Window):
 
         try:
             # Importing tkinter is very slow and not used very often. Let's delay import.
-            from tkinter import Tk
-            from tkinter import tkFileDialog as filedialog
+            from tkinter import filedialog
 
-            if root is None:
-                root = Tk()
-                root.withdraw()
             dialog = filedialog.SaveAs(
-                root, initialdir=save_dir, title="Select file save location", filetypes=filetypes
+                parent=None,
+                initialdir=save_dir,
+                title="Select file save location",
+                filetypes=filetypes,
+                defaultextension=".png",
             )
             filename = dialog.show()
         except Exception as e:
@@ -1070,20 +980,23 @@ class Viewer(pyglet.window.Window):
 
         if not filename:
             return None
-        return filename
+        return os.path.normpath(filename)
 
     def _save_image(self):
+        # Postpone import of OpenCV at runtime to reduce hard system dependencies
+        import cv2
+
         filename = self._get_save_filename(["png", "jpg", "gif", "all"])
         if filename is not None:
             self.viewer_flags["save_directory"] = os.path.dirname(filename)
             data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
-            imageio.imwrite(filename, data)
+            cv2.imwrite(filename, np.flip(data, axis=-1))
 
     def _record(self):
         """Save another frame for the GIF."""
         data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
         if not np.all(data == 0.0):
-            self.video_recorder.write_frame(data)
+            self._video_recorder.write_frame(data)
 
     def _rotate(self):
         """Animate the scene by rotating the camera."""
@@ -1129,9 +1042,9 @@ class Viewer(pyglet.window.Window):
         elif self.render_flags["all_solid"]:
             flags |= RenderFlags.ALL_SOLID
 
-        if self.render_flags["shadows"]:
+        if self.render_flags["shadows"] and not self._is_software:
             flags |= RenderFlags.SHADOWS_ALL
-        if self.render_flags["plane_reflection"]:
+        if self.render_flags["plane_reflection"] and not self._is_software:
             flags |= RenderFlags.REFLECTIVE_FLOOR
         if self.render_flags["env_separate_rigid"]:
             flags |= RenderFlags.ENV_SEPARATE
@@ -1144,6 +1057,10 @@ class Viewer(pyglet.window.Window):
 
         if self.render_flags["offscreen"]:
             flags |= RenderFlags.OFFSCREEN
+        if self.render_flags.get("skip_markers", False):
+            flags |= RenderFlags.SKIP_MARKERS
+        else:
+            flags |= RenderFlags.MARKER_XRAY
 
         seg_node_map = None
         if self.render_flags["seg"]:
@@ -1155,12 +1072,15 @@ class Viewer(pyglet.window.Window):
             if not (self.render_flags["rgb"] or self.render_flags["seg"]):
                 flags |= RenderFlags.DEPTH_ONLY
 
+        first_pass_done = False
         if self.render_flags["rgb"] or self.render_flags["depth"] or self.render_flags["seg"]:
             retval = renderer.render(self.scene, flags, seg_node_map=seg_node_map)
+            first_pass_done = True
         else:
             retval = ()
 
         if normal:
+
             class CustomShaderCache:
                 def __init__(self):
                     self.program = None
@@ -1180,8 +1100,10 @@ class Viewer(pyglet.window.Window):
             flags = RenderFlags.FLAT | RenderFlags.OFFSCREEN
             if self.render_flags["env_separate_rigid"]:
                 flags |= RenderFlags.ENV_SEPARATE
+            if self.render_flags.get("skip_markers", False):
+                flags |= RenderFlags.SKIP_MARKERS
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-            normal_arr, *_ = renderer.render(scene, flags, is_first_pass=False)
+            normal_arr, *_ = renderer.render(scene, flags, is_first_pass=not first_pass_done)
             retval = (*retval, normal_arr)
 
             renderer._program_cache = old_cache
@@ -1192,17 +1114,36 @@ class Viewer(pyglet.window.Window):
         return retval
 
     def start(self, auto_refresh=True):
+        import pyglet  # For some reason, this is necessary if 'pyglet.window.xlib' fails to import...
+        import pyglet.app
+
+        try:
+            import pyglet.display.xlib
+            import pyglet.window.xlib
+
+            xlib_exceptions = (pyglet.window.xlib.XlibException, pyglet.display.xlib.NoSuchDisplayException)
+        except ImportError:
+            xlib_exceptions = ()
+
+        # Pyglet's Win32EventLoop captures the thread that first instantiates it and refuses ``dispatch_events``
+        # from any other thread. Mixing ``run_in_thread=True`` and ``run_in_thread=False`` viewers in the same
+        # Python process (typical in unit tests) leaves a stale thread id behind. Recreate the platform event
+        # loop here so its constructor rebinds the dispatch thread to whoever is about to call us.
+        pyglet.app.platform_event_loop = pyglet.app.PlatformEventLoop()
+
         # Try multiple configs starting with target OpenGL version and multisampling enabled, then removing these
         # options if not supported.
         confs = [
             pyglet.gl.Config(
                 depth_size=24,
+                alpha_size=8,  # This parameter is essential to ensure proper pixel matching across platforms
                 double_buffer=True,  # Double buffering to avoid flickering
                 major_version=TARGET_OPEN_GL_MAJOR,
                 minor_version=TARGET_OPEN_GL_MINOR,
             ),
             pyglet.gl.Config(
                 depth_size=24,
+                alpha_size=8,
                 double_buffer=True,
                 major_version=MIN_OPEN_GL_MAJOR,
                 minor_version=MIN_OPEN_GL_MINOR,
@@ -1215,7 +1156,7 @@ class Viewer(pyglet.window.Window):
             # of nearest neighbors, and there is no way to tweak this behavior.
             confs = [
                 pyglet.gl.Config(
-                    sample_buffers=1,    # Enable multi-sampling (MSAA)
+                    sample_buffers=1,  # Enable multi-sampling (MSAA)
                     samples=2,
                     depth_size=24,
                     double_buffer=True,
@@ -1233,55 +1174,126 @@ class Viewer(pyglet.window.Window):
                 ),
                 confs[1],
             ]
-        for conf in confs:
-            # Keep the window invisible for now. It will be displayed only if everything is working fine.
-            # This approach avoids "flickering" when creating and closing an invalid context. Besides, it avoids
-            # "frozen" graphical window during compilation that would be interpreted as as bug by the end-user.
+        while confs:
+            conf = confs.pop(0)
+
+            # Close any existing context and window
             try:
-                super().__init__(
-                    config=conf,
-                    visible=False,
-                    resizable=True,
-                    width=self._viewport_size[0],
-                    height=self._viewport_size[1],
-                )
-                break
-            except (pyglet.window.NoSuchConfigException, pyglet.gl.ContextException):
+                OpenGL.contextdata.cleanupContext()
+                self.set_visible(False)
+            except Exception:
+                pass
+            try:
+                super().close()
+            except Exception:
                 pass
 
-        if not self.context:
-            raise RuntimeError("Unable to initialize an OpenGL 3+ context")
-        pyglet.clock.schedule_interval(Viewer._time_event, 1.0 / self.viewer_flags["refresh_rate"], self)
-        self.switch_to()
+            try:
+                # Keep the window invisible for now. It will be displayed only if everything is working fine.
+                # This approach avoids "flickering" when creating and closing an invalid context. Besides, it avoids
+                # "frozen" graphical window during compilation that would be interpreted as as bug by the end-user.
+                try:
+                    super().__init__(
+                        config=conf,
+                        visible=False,
+                        resizable=True,
+                        width=self._viewport_size[0],
+                        height=self._viewport_size[1],
+                    )
+                except xlib_exceptions as e:
+                    # Trying again without UTF8 support as a fallback.
+                    # See: https://github.com/pyglet/pyglet/issues/1024
+                    if pyglet.window.xlib._have_utf8:
+                        pyglet.window.xlib._have_utf8 = False
+                        confs.insert(0, conf)
+                    raise
+
+                # Determine if software emulation is being used
+                glinfo = self.context.get_info()
+                renderer = glinfo.get_renderer()
+                self._is_software = any(e in renderer for e in ("llvmpipe", "Apple Software Renderer"))
+
+                # Run the entire rendering pipeline first without window, to make sure that all kernels are compiled
+                self.refresh()
+
+                # At this point, we are all set to display the graphical window
+                self.set_visible(True)
+
+                # Run the entire rendering pipeline once again, as a final validation that everything is fine
+                self.refresh()
+
+                break
+            except (
+                pyglet.window.NoSuchConfigException,
+                pyglet.gl.ContextException,
+                pyglet.gl.GLException,
+                OpenGL.error.Error,
+                AttributeError,
+                ArgumentError,
+                RuntimeError,
+                TypeError,  # Race conditions wheno accessing OpenGL resources not binded to context yet
+                Exception,  # Just in case, to avoid deadlock when running in thread
+            ) as e:
+                if not confs:
+                    # It is essential to set the exception before closing the viewer, otherwise the main thread preempt
+                    # execution of this thread and wrongly report unknown exception.
+                    if self._run_in_thread:
+                        self._exception = e
+
+                    # Now the viewer can be safely cause to avoid leaving any global OpenGL context or window dangling
+                    try:
+                        self.on_close()
+                    except Exception:
+                        pass
+
+                    if self._run_in_thread:
+                        # Reporting the exception for the main thread to raise it
+                        return
+                    else:
+                        # Raise the exception right away
+                        raise RuntimeError("Unable to initialize an OpenGL 3+ context.") from e
+
+        if self._run_in_thread:
+            pyglet.clock.schedule_interval(Viewer._time_event, 1.0 / self.viewer_flags["refresh_rate"], self)
+        else:
+            # Run as fast as possible if not running in thread
+            pyglet.clock.schedule(Viewer._time_event, self)
+
+        # Update window title
         self.set_caption(self.viewer_flags["window_title"])
-
-        # Run the entire rendering pipeline once, to make sure that everything is fine.
-        try:
-            self.refresh()
-        except OpenGL.error.Error as e:
-            # Invalid OpenGL context. Closing before anything else.
-            self.on_close()
-
-            if self._run_in_thread:
-                # Reporting the exception for the main thread to raise it
-                self._exception = e
-                return
-            else:
-                # Raise the exception right away
-                raise
-
-        # At this point, we are all set to display the graphical window if requested, finally!
-        if not pyglet.options["headless"]:
-            self.set_visible(True)
         self.activate()
 
+        # The viewer can be considered as fully initialized at this point
+        if not self._initialized_event.is_set():
+            self._initialized_event.set()
+
+        gs.logger.debug(f"Using interactive viewer OpenGL device: {renderer}")
+        if self._is_software:
+            gs.logger.info(
+                "Software rendering context detected. Shadows and plane reflection not supported. Beware rendering "
+                "will be extremely slow."
+            )
+
         if auto_refresh:
-            while self._is_active:
-                try:
-                    self.refresh()
-                except AttributeError:
-                    # The graphical window has been closed
-                    self.on_close()
+            is_invalid = False
+            try:
+                while self._is_active:
+                    try:
+                        self.refresh()
+                        is_invalid = False
+                    except AttributeError:
+                        # The graphical window has been closed manually
+                        pass
+                    except pyglet.gl.GLException as e:
+                        # Refresh may fail in rare occurrences due to what looks like a race condition.
+                        # Trying once in such a case is usually sufficent to succeed without risking deadlock.
+                        if is_invalid or (f"(0x{pyglet.gl.GL_INVALID_OPERATION})" not in str(e)):
+                            raise
+                        is_invalid = True
+            except Exception as e:
+                if self._exception is None:
+                    self._exception = e
+            self.on_close()
         else:
             self.refresh()
 
@@ -1295,37 +1307,48 @@ class Viewer(pyglet.window.Window):
             try:
                 self.refresh()
             except AttributeError:
-                # The graphical window has been closed
-                self.on_close()
+                # The graphical window has been closed manually
+                pass
+        self.on_close()
 
     def refresh(self):
         viewer_thread = self._thread or threading.main_thread()
         if viewer_thread != threading.current_thread():
             raise RuntimeError("'Viewer.refresh' can only be called from the thread that started the viewer.")
 
-        time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
-        while self._offscreen_event.wait(time_next_frame - time.time()):
-            self.draw_offscreen()
-            self._offscreen_event.clear()
+        if self._run_in_thread:
+            time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
+            while self._offscreen_event.wait(time_next_frame - time.time()):
+                self._event_loop_step_offscreen()
+                self._offscreen_event.clear()
 
-        pyglet.clock.tick()
+        self.switch_to()
 
-        if gs.platform != "Windows":
-            pyglet.app.platform_event_loop.step(0.0)
-        else:
+        # Dispatch input events before drawing, so the frame (and the ImGui overlay / gizmo it renders) reacts to the
+        # current mouse and keyboard state. Drawing first and dispatching afterwards leaves interactive controls one
+        # frame behind the cursor, which makes dragging the gizmo feel stuttery.
+        if sys.platform == "win32":
             # even changing `platform_event_loop.step(0.0)` to 0.001 causes the viewer to hang on Windows
             # this is a workaround on Windows. not sure if it's correct
             time.sleep(0.001)
+        else:
+            pyglet.app.platform_event_loop.step(0.0)
 
-        self.switch_to()
         self.dispatch_pending_events()
         if self._is_active:
             self.dispatch_events()
+
+        pyglet.clock.tick()
+
         if self._is_active:
             self.flip()
 
     def update_on_sim_step(self):
-        self.viewer_interaction.update_on_sim_step()
+        # Call HOLD callbacks for all currently held keys
+        for symbol, modifiers in list(self._held_keys.keys()):
+            self._call_keybind_callback(symbol, modifiers, KeyAction.HOLD)
+        for plugin in self.plugins:
+            plugin.update_on_sim_step()
 
     def _compute_initial_camera_pose(self):
         centroid = self.scene.centroid
@@ -1393,6 +1416,72 @@ class Viewer(pyglet.window.Window):
             return (self.viewport_size[0] - TEXT_PADDING, self.viewport_size[1] - TEXT_PADDING)
         elif location == TextAlign.TOP_CENTER:
             return (self.viewport_size[0] / 2.0, self.viewport_size[1] - TEXT_PADDING)
+
+    def _update_instr_texts(self):
+        """Update the instruction text based on current keybindings."""
+        if not self._enable_help_text:
+            return
+
+        self._key_instr_texts = self._instr_texts[0] + [
+            # f"{'[' + get_keycode_string(kb.key_code):>{7}}]: " + kb.name.replace("_", " ")
+            f"{'[' + str(kb.key):>{7}}]: " + kb.name.replace("_", " ")
+            for kb in self._keybindings.keybinds
+            if kb.name != HELP_TEXT_KEYBIND_NAME
+        ]
+
+    def _toggle_instructions(self):
+        """Toggle the display of keyboard instructions."""
+        if not self._enable_help_text:
+            raise RuntimeError("Instructions display is disabled.")
+        self._collapse_instructions = not self._collapse_instructions
+
+    def set_message_text(self, text: str):
+        """Set a temporary message to display on the viewer."""
+        self._message_text = text
+        self._message_opac = 1.0 + self._ticks_till_fade
+
+    def _render_help_text(self):
+        """Render help text and messages on the viewer."""
+        if not self._enable_help_text:
+            return
+
+        # Render temporary message
+        if self._message_text is not None:
+            self._renderer.render_text(
+                self._message_text,
+                self._viewport_size[0] - TEXT_PADDING,
+                TEXT_PADDING,
+                font_pt=FONT_SIZE,
+                color=np.array([0.1, 0.7, 0.2, np.clip(self._message_opac, 0.0, 1.0)]),
+                align=TextAlign.BOTTOM_RIGHT,
+            )
+
+            if self._message_opac > 1.0:
+                self._message_opac -= 1.0
+            else:
+                self._message_opac *= 0.90
+
+            if self._message_opac < 0.05:
+                self._message_opac = 1.0 + self._ticks_till_fade
+                self._message_text = None
+
+        # Render keyboard instructions
+        if self._collapse_instructions:
+            self._renderer.render_texts(
+                self._instr_texts[0],
+                TEXT_PADDING,
+                self._viewport_size[1] - TEXT_PADDING,
+                font_pt=FONT_SIZE,
+                color=self._font_color,
+            )
+        else:
+            self._renderer.render_texts(
+                self._key_instr_texts,
+                TEXT_PADDING,
+                self._viewport_size[1] - TEXT_PADDING,
+                font_pt=FONT_SIZE,
+                color=self._font_color,
+            )
 
 
 __all__ = ["Viewer"]

@@ -84,7 +84,7 @@ def get_device_by_index(device_id):
 
     devices = query_devices()
     if device_id >= len(devices):
-        raise ValueError("Invalid device ID ({})".format(device_id, len(devices)))
+        raise ValueError("Invalid device ID ({}) with {} devices".format(device_id, len(devices)))
     return devices[device_id]
 
 
@@ -141,14 +141,12 @@ class EGLPlatform(Platform):
             EGL_OPENGL_BIT,
             EGL_CONFORMANT,
             EGL_NONE,
-            EGL_DEFAULT_DISPLAY,
             EGL_NO_CONTEXT,
             EGL_OPENGL_API,
             EGL_CONTEXT_MAJOR_VERSION,
             EGL_CONTEXT_MINOR_VERSION,
             EGL_CONTEXT_OPENGL_PROFILE_MASK,
             EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            eglGetDisplay,
             eglInitialize,
             eglChooseConfig,
             eglBindAPI,
@@ -261,16 +259,22 @@ class EGLPlatform(Platform):
 
     def make_uncurrent(self):
         """Make the OpenGL context uncurrent."""
-        pass
-
-    def delete_context(self):
-        from OpenGL.EGL import eglDestroyContext, eglTerminate
+        from OpenGL.EGL import eglMakeCurrent, EGL_NO_SURFACE, EGL_NO_CONTEXT
 
         if self._egl_display is not None:
+            eglMakeCurrent(self._egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)
+
+    def delete_context(self):
+        from OpenGL.EGL import eglDestroyContext
+
+        if self._egl_display is not None:
+            self.make_uncurrent()
             if self._egl_context is not None:
                 eglDestroyContext(self._egl_display, self._egl_context)
                 self._egl_context = None
-            eglTerminate(self._egl_display)
+            # NOTE: intentionally not calling eglTerminate here. The NVIDIA EGL
+            # driver does not support terminate/re-initialize cycles on the same
+            # device (returns EGL_BAD_ACCESS), which breaks multi-scene workflows.
             self._egl_display = None
 
     def supports_framebuffers(self):

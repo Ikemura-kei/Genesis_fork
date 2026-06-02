@@ -10,8 +10,7 @@ from OpenGL.GL import *
 import genesis as gs
 
 from .constants import RenderFlags
-from .renderer import Renderer
-from .shader_program import ShaderProgram, ShaderProgramCache
+from .shader_program import ShaderProgram
 
 
 MODULE_DIR = os.path.dirname(__file__)
@@ -76,8 +75,7 @@ class OffscreenRenderer(object):
 
         self._platform.make_current()
 
-        # If platform does not support dynamically-resizing framebuffers,
-        # destroy it and restart it
+        # If platform does not support dynamically-resizing framebuffers, destroy it and restart it
         if (
             self._platform.viewport_height != self.viewport_height
             or self._platform.viewport_width != self.viewport_width
@@ -113,6 +111,7 @@ class OffscreenRenderer(object):
         shadow=False,
         plane_reflection=False,
         env_separate_rigid=False,
+        skip_markers=False,
     ):
         """Render a scene with the given set of flags.
 
@@ -157,6 +156,11 @@ class OffscreenRenderer(object):
         if env_separate_rigid:
             flags |= RenderFlags.ENV_SEPARATE
 
+        if skip_markers:
+            flags |= RenderFlags.SKIP_MARKERS
+        else:
+            flags |= RenderFlags.MARKER_XRAY
+
         if seg:
             seg_node_map = self._seg_node_map
             flags |= RenderFlags.SEG
@@ -166,14 +170,17 @@ class OffscreenRenderer(object):
         if depth:
             flags |= RenderFlags.RET_DEPTH
 
+        first_pass_done = False
         if rgb or depth or seg:
             if self._platform.supports_framebuffers():
                 flags |= RenderFlags.OFFSCREEN
                 retval = renderer.render(scene, flags, seg_node_map)
+                assert retval is not None
             else:
                 if flags & RenderFlags.ENV_SEPARATE:
                     gs.raise_exception("'env_separate_rigid=True' not supported on this platform.")
-                renderer.render(scene, flags, seg_node_map)
+                result = renderer.render(scene, flags, seg_node_map)
+                assert result is not None
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
                 glReadBuffer(GL_FRONT)
                 if depth:
@@ -189,10 +196,12 @@ class OffscreenRenderer(object):
                     color_arr = renderer.jit.read_color_buf(self.viewport_height, self.viewport_width, rgba=False)
                     color_arr = renderer._resize_image(color_arr, antialias=not seg)
                     retval = (color_arr, depth_arr) if depth else (color_arr,)
+            first_pass_done = True
         else:
             retval = ()
 
         if normal:
+
             class CustomShaderCache:
                 def __init__(self):
                     self.program = None
@@ -212,14 +221,18 @@ class OffscreenRenderer(object):
             flags = RenderFlags.FLAT | RenderFlags.OFFSCREEN
             if env_separate_rigid:
                 flags |= RenderFlags.ENV_SEPARATE
+            if skip_markers:
+                flags |= RenderFlags.SKIP_MARKERS
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
             if self._platform.supports_framebuffers():
-                normal_arr, *_ = renderer.render(scene, flags, is_first_pass=False, force_skip_shadows=True)
+                normal_arr, *_ = renderer.render(
+                    scene, flags, is_first_pass=not first_pass_done, force_skip_shadows=True
+                )
             else:
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
                 glReadBuffer(GL_FRONT)
-                renderer.render(scene, flags, is_first_pass=False, force_skip_shadows=True)
+                renderer.render(scene, flags, is_first_pass=not first_pass_done, force_skip_shadows=True)
                 normal_arr = renderer.jit.read_color_buf(self.viewport_height, self.viewport_width, rgba=False)
                 normal_arr = renderer._resize_image(normal_arr, antialias=not seg)
 
@@ -238,9 +251,6 @@ class OffscreenRenderer(object):
         self._platform.delete_context()
         del self._platform
         self._platform = None
-        import gc
-
-        gc.collect()
 
     def _create(self, platform):
         if platform == "pyglet":
@@ -262,20 +272,22 @@ class OffscreenRenderer(object):
         else:
             raise ValueError("Unsupported PyOpenGL platform: {}".format(platform))
         self._platform.init_context()
-        self._platform.make_current()
 
+        self._platform.make_current()
         try:
             from OpenGL.GL import glGetString, GL_RENDERER
 
             renderer = glGetString(GL_RENDERER).decode()
-            self._is_software = "llvmpipe" in renderer
-        except:
+            gs.logger.debug(f"Using offscreen rendering OpenGL device: {renderer}")
+            self._is_software = any(e in renderer for e in ("llvmpipe", "Apple Software Renderer"))
+        except Exception:
             pass
         if self._is_software:
             gs.logger.info(
                 "Software rendering context detected. Shadows and plane reflection not supported. Beware rendering "
                 "will be extremely slow."
             )
+        self._platform.make_uncurrent()
 
     def __del__(self):
         try:

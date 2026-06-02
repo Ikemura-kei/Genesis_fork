@@ -48,15 +48,15 @@ def torch_op_wrapper(torch_op):
 
         if torch_op is torch.from_numpy:
             torch_tensor = torch_op(*args)
+        elif torch_op is torch.tensor:
+            torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad)
         else:
             torch_tensor = torch_op(*args, **kwargs)
 
         return from_torch(torch_tensor, dtype, requires_grad, detach=True, scene=scene)
 
     _wrapper.__doc__ = (
-        f"This method is the genesis wrapper of `torch.{torch_op.__name__}`.\n\n"
-        "------------------\n"
-        f"{_wrapper.__doc__}"
+        f"This method is the genesis wrapper of `torch.{torch_op.__name__}`.\n\n------------------\n{_wrapper.__doc__}"
     )
 
     return _wrapper
