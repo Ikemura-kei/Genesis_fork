@@ -311,7 +311,7 @@ class MPMEntity(ParticleEntity):
         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
         Jp: qd.types.ndarray(),  # shape [B, n_particles]
         active: qd.types.ndarray(),  # shape [B, n_particles]
-        von_mises: ti.types.ndarray(),  # shape [B, n_particles]
+        von_mises: qd.types.ndarray(),  # shape [B, n_particles]
     ):
         """
         Extract the state of particles at the given substep.

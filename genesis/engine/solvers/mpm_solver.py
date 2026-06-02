@@ -92,7 +92,7 @@ class MPMSolver(Solver):
             S=gs.qd_mat3,  # SVD
             actu=gs.qd_float,  # actuation
             Jp=gs.qd_float,  # volume ratio
-            von_mises=gs.ti_float, # von mises stress
+            von_mises=gs.qd_float, # von mises stress
         )
 
         # dynamic particle state without gradient
@@ -259,7 +259,7 @@ class MPMSolver(Solver):
                     "calculated based on `grid_density`). Simulation might be unstable."
                 )
                 
-        self.envs_offset = ti.Vector.field(3, dtype=ti.f32, shape=self._B)
+        self.envs_offset = qd.field(dtype=gs.qd_vec3, shape=(self._B,))
         self.envs_offset.from_numpy(self._scene.envs_offset.astype(np.float32))
 
         # FIXME: _gravity must be a raw qd.field() because LegacyCoupler.mpm_grid_op accesses it via template attribute on a
@@ -442,7 +442,7 @@ class MPMSolver(Solver):
                         s_xy = stress[0, 1] / J
                         s_xz = stress[0, 2] / J
                         s_yz = stress[1, 2] / J
-                        von_mises = ti.math.sqrt(0.5 * ((s_xx - s_yy) ** 2 + (s_yy - s_zz) ** 2 + (s_zz - s_xx) ** 2 + 6 * (s_xy ** 2 + s_yz ** 2 + s_xz ** 2)))
+                        von_mises = qd.math.sqrt(0.5 * ((s_xx - s_yy) ** 2 + (s_yy - s_zz) ** 2 + (s_zz - s_xx) ** 2 + 6 * (s_xy ** 2 + s_yz ** 2 + s_xz ** 2)))
                         self.particles[f, i_p, i_b].von_mises = von_mises
                         
                 stress = (-self.substep_dt * self._particle_volume * 4 * self._inv_dx * self._inv_dx) * stress
