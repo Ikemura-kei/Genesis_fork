@@ -76,13 +76,20 @@ class ContactSensorMetadata(SimpleSensorMetadata):
     thresholds: torch.Tensor = make_tensor_field((0,))
 
 
-class ContactSensor(SimpleSensor[ContactSensorOptions, ContactSensorMetadata]):
+class ContactSensor(SimpleSensor[ContactSensorOptions, None, ContactSensorMetadata]):
     """
     Sensor that returns bool based on whether associated RigidLink is in contact.
     """
 
-    def __init__(self, sensor_options: ContactSensorOptions, sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: ContactSensorOptions,
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
 
         self._link: "RigidLink | None" = None
         self.debug_object: "Mesh | None" = None
@@ -132,7 +139,7 @@ class ContactSensor(SimpleSensor[ContactSensorOptions, ContactSensorMetadata]):
         return gs.tc_float
 
     @classmethod
-    def _update_raw_data(cls, shared_metadata: ContactSensorMetadata, raw_data_T: torch.Tensor):
+    def _update_raw_data(cls, shared_context: None, shared_metadata: ContactSensorMetadata, raw_data_T: torch.Tensor):
         assert shared_metadata.solver is not None
         all_contacts = shared_metadata.solver.collider.get_contacts(as_tensor=True, to_torch=True)
         link_a, link_b = all_contacts["link_a"], all_contacts["link_b"]
@@ -172,7 +179,7 @@ class ContactSensor(SimpleSensor[ContactSensorOptions, ContactSensorMetadata]):
         """
         env_idx = context.rendered_envs_idx[0] if self._manager._sim.n_envs > 0 else None
 
-        pos = self._link.get_pos(env_idx).reshape((3,))
+        pos = self._link.get_pos(env_idx, relative=False).reshape((3,))
         is_contact = self.read(env_idx)
 
         if self.debug_object is not None:
@@ -199,14 +206,22 @@ class ContactForceSensorMetadata(RigidSensorMetadataMixin, SimpleSensorMetadata)
 
 
 class ContactForceSensor(
-    RigidSensorMixin[ContactForceSensorMetadata], SimpleSensor[ContactForceSensorOptions, ContactForceSensorMetadata]
+    RigidSensorMixin[ContactForceSensorMetadata],
+    SimpleSensor[ContactForceSensorOptions, None, ContactForceSensorMetadata],
 ):
     """
     Sensor that returns the total contact force being applied to the associated RigidLink in its local frame.
     """
 
-    def __init__(self, options: ContactForceSensorOptions, sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: ContactForceSensorOptions,
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
 
         self.debug_object: "Mesh" | None = None
 
@@ -237,7 +252,9 @@ class ContactForceSensor(
         return cls._get_cache_dtype()
 
     @classmethod
-    def _update_raw_data(cls, shared_metadata: ContactForceSensorMetadata, raw_data_T: torch.Tensor):
+    def _update_raw_data(
+        cls, shared_context: None, shared_metadata: ContactForceSensorMetadata, raw_data_T: torch.Tensor
+    ):
         assert shared_metadata.solver is not None
 
         # Note that forcing GPU sync to operate on `slice(0, max(n_contacts))` is usually faster overall.
@@ -296,8 +313,8 @@ class ContactForceSensor(
         """
         env_idx = context.rendered_envs_idx[0] if self._manager._sim.n_envs > 0 else None
 
-        pos = self._link.get_pos(env_idx).reshape((3,))
-        quat = self._link.get_quat(env_idx).reshape((4,))
+        pos = self._link.get_pos(env_idx, relative=False).reshape((3,))
+        quat = self._link.get_quat(env_idx, relative=False).reshape((4,))
 
         force = self.read(env_idx).reshape((3,))
         vec = tensor_to_array(transform_by_quat(force * self._options.debug_scale, quat))

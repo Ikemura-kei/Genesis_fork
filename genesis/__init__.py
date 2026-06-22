@@ -263,7 +263,8 @@ def init(
             enable_fallback=False,
             # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
             debug=qd_debug and backend == _gs_backend.cpu,
-            check_out_of_bound=debug and backend != _gs_backend.metal,
+            # Forcibly disabling out of bound checks on GPU because memory usage is blowing up (x10)
+            check_out_of_bound=debug and backend == gs.cpu,  # backend != _gs_backend.metal,
             # force_scalarize_matrix=True for speeding up kernel compilation
             # FIXME: Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
             force_scalarize_matrix=True,
@@ -375,12 +376,16 @@ def destroy():
     if logger:
         logger.info("💤 Exiting Genesis and caching compiled kernels...")
 
-    # Destroy all scenes
+    # Destroy all scenes. A weakref that no longer resolves means the scene was already garbage-collected (and its
+    # resources released), so there is nothing left to destroy - skip it rather than asserting.
     global _scene_registry
     for scene_ref in _scene_registry.copy():
         scene = scene_ref()
-        assert scene is not None
-        scene.destroy()
+        if scene is not None:
+            scene.destroy()
+
+    # Release cached RGBA textures so large image arrays from destroyed scenes are not retained globally.
+    surfaces.clear_rgba_cache()
 
     # Destroy all externally registered modules
     for _init_fun, destroy_fun in _module_registry:

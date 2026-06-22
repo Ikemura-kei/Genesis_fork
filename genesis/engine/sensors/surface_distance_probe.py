@@ -209,12 +209,19 @@ class SurfaceDistanceProbeMetadata(
 class SurfaceDistanceProbeSensor(
     ProbeSensorMixin[SurfaceDistanceProbeMetadata],
     RigidSensorMixin[SurfaceDistanceProbeMetadata],
-    SimpleSensor[SurfaceDistanceProbeOptions, SurfaceDistanceProbeMetadata, tuple],
+    SimpleSensor[SurfaceDistanceProbeOptions, None, SurfaceDistanceProbeMetadata, tuple],
 ):
     """Surface distance probe: distance and nearest point from probe positions to tracked mesh surfaces."""
 
-    def __init__(self, sensor_options: SurfaceDistanceProbeOptions, sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: SurfaceDistanceProbeOptions,
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
         self._debug_objects: list = []
         self._nearest_points_slice: slice | None = None
 
@@ -266,6 +273,7 @@ class SurfaceDistanceProbeSensor(
     @classmethod
     def _update_current_timestep_data(
         cls,
+        shared_context: None,
         shared_metadata: SurfaceDistanceProbeMetadata,
         current_ground_truth_data_T: torch.Tensor,
         ground_truth_data_timeline: "TensorRingBuffer | None",
@@ -314,8 +322,8 @@ class SurfaceDistanceProbeSensor(
             context.clear_debug_object(obj)
         self._debug_objects.clear()
 
-        link_pos = self._link.get_pos(env_idx).squeeze()
-        link_quat = self._link.get_quat(env_idx).squeeze()
+        link_pos = self._link.get_pos(env_idx, relative=False).squeeze()
+        link_quat = self._link.get_quat(env_idx, relative=False).squeeze()
         probe_world = tensor_to_array(gu.transform_by_trans_quat(self._probe_local_pos, link_pos, link_quat))
         points = tensor_to_array(self.nearest_points[env_idx]).reshape(-1, 3)
 

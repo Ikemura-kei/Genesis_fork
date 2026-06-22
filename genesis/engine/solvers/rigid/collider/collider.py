@@ -43,12 +43,12 @@ from .contact import (
     func_add_contact,
     func_set_contact,
     func_add_diff_contact_input,
-    func_compute_tolerance,
+    func_compute_geom_pair_scale,
     func_contact_orthogonals,
     func_rotate_frame,
     func_set_upstream_grad,
-    func_clamp_prune_and_sort_contacts,
-    func_clamp_prune_and_sort_contacts_coop,
+    func_clamp_prune_contacts,
+    func_clamp_prune_contacts_coop,
 )
 from . import narrowphase
 from .narrowphase import (
@@ -83,13 +83,21 @@ class Collider:
     def __init__(self, rigid_solver: "RigidSolver"):
         self._solver = rigid_solver
 
-        self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
-        self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
+        self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 3e-3
+        self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1.5e-2
         self._mpr_to_gjk_overlap_ratio = 0.25
+        # Minimum ratio of the current penetration to the cached warm-start penetration for MPR to be treated as
+        # having resolved a deeper, non-minimal portal (then upgraded to GJK). At the gate the threshold is clamped
+        # into [tolerance, mpr_to_gjk_overlap_ratio * geom_scale], so a cold pair (cached penetration reset to 0)
+        # reduces to the original "penetration > tolerance" gate and a genuinely deep contact always upgrades.
+        self._mpr_to_gjk_penetration_ratio = 5.0
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
         self._diff_normal_tolerance = 1e-2
         self._prune_deep_penetration_ratio = 3.0
+        self._prune_max_contacts_per_link_pair = 32
+        self._prune_max_contacts_floor = 512
+        self._noslip_max_contacts = 128
 
         self._init_static_config()
         self._use_split_narrowphase = (
@@ -167,17 +175,16 @@ class Collider:
             has_non_box_plane_convex_convex,
             has_convex_specialization,
             has_nonconvex_nonterrain,
-            self._n_possible_nonconvex_pairs,
+            self._large_contact_pair_mask,
         ) = self._compute_collision_pair_idx()
 
         # Link-pair pruning can do useful work only when contacts from distinct geom-pairs can accumulate into the same
         # (link_a, link_b) bucket. That happens when any link has more than one geom (compound/decomposed body), when
         # any geom is nonconvex (vertex-based narrowphase emits many contacts per pair), or when terrain is present.
-        # Disabled outright when use_contact_island is True: pruning produces a logical permutation in contact_sort_idx
-        # that the contact-island construction kernel does not honor (it reads contact_data in physical order).
-        if self._solver._options.use_contact_island:
-            has_prunable_contacts = False
-        elif has_nonconvex_nonterrain or has_terrain:
+        # Composes with contact islands: pruning writes a logical permutation into contact_sort_idx, and the island
+        # construction reads contacts through that permutation, so pruning collapses the contacts before islands
+        # partition the (smaller) solve.
+        if has_nonconvex_nonterrain or has_terrain:
             has_prunable_contacts = True
         else:
             has_prunable_contacts = False
@@ -200,27 +207,16 @@ class Collider:
                         ):
                             has_prunable_contacts = True
 
-        # Spatial sort by x-position only runs on GPU for convex-convex scenes whose contacts could benefit from
-        # locality. Disabled when use_contact_island is True for the same reason as pruning. Also disabled in
-        # autodiff mode: the sort permutes the logical contact order via contact_sort_idx, get_contacts applies that
-        # permutation, but func_set_upstream_grad writes upstream gradients back by physical index, so a non-identity
-        # permutation would attach gradients to the wrong contacts.
+        # Spatial sort by x-position (with a geom-pair tie-break) only runs on GPU for convex-convex scenes whose
+        # contacts could benefit from locality, and is also what makes the GPU contact order run-independent: the
+        # narrowphase reserves contact slots via atomic_add (a non-deterministic physical layout), and the sort writes
+        # a deterministic permutation into contact_sort_idx that every downstream consumer - including the island
+        # construction - reads through. Disabled only in autodiff mode: get_contacts applies the permutation but
+        # func_set_upstream_grad writes upstream gradients back by physical index, so a non-identity permutation would
+        # attach gradients to the wrong contacts.
         spatial_sort_supported = (
-            has_non_box_plane_convex_convex
-            and gs.backend != gs.cpu
-            and not self._solver._options.use_contact_island
-            and not self._solver._requires_grad
+            has_non_box_plane_convex_convex and gs.backend != gs.cpu and not self._solver._requires_grad
         )
-
-        # Hibernation (func_collision_clear / func_collider_clear_env in this module's siblings) advects carried
-        # contacts by walking physical slots [0, n_contacts), which only matches the live set when sort_idx is the
-        # identity. The use_hibernation -> use_contact_island chain in RigidSolver already enforces that pruning and
-        # spatial sort are off, so this is a defensive assertion meant to fail loudly if either gate is loosened.
-        if self._solver._use_hibernation and (has_prunable_contacts or spatial_sort_supported):
-            gs.raise_exception(
-                "Hibernation is incompatible with link-pair pruning and spatial sort: both reorder logical contacts "
-                "via contact_sort_idx, but the hibernation advect loop reads contact_data in physical order."
-            )
 
         # Initialize the static config, which stores every data that are compile-time constants.
         # Note that updating any of them will trigger recompilation.
@@ -252,6 +248,7 @@ class Collider:
             mc_perturbation=self._mc_perturbation,
             mc_tolerance=self._mc_tolerance,
             mpr_to_gjk_overlap_ratio=self._mpr_to_gjk_overlap_ratio,
+            mpr_to_gjk_penetration_ratio=self._mpr_to_gjk_penetration_ratio,
             diff_pos_tolerance=self._diff_pos_tolerance,
             diff_normal_tolerance=self._diff_normal_tolerance,
             contact_pruning_tolerance=self._solver._options.contact_pruning_tolerance or 0.0,
@@ -260,7 +257,7 @@ class Collider:
         self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
-        self._init_max_contact_pairs(self._n_possible_pairs, self._n_possible_nonconvex_pairs)
+        self._init_max_contacts(self._n_possible_pairs, self._large_contact_pair_mask)
         self._init_terrain_state()
 
         # Initialize [state], which stores every data that are may be updated at every single simulation step
@@ -306,19 +303,17 @@ class Collider:
             self._contact0_mpr_state = array_class.get_mpr_state(self._contact0_grid_size)
             self._contact0_gjk_state = array_class.get_gjk_state_contact_only(self._contact0_grid_size)
 
-            if self._collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK):
-                self._multicontact_n_gjk_threads = gpu_cores
-            else:
-                # Heuristic to distribute the workflow between GJK and MPR
-                self._multicontact_n_gjk_threads = math.ceil((gpu_cores // 32) / 64) * 64
             self._multicontact_n_total_threads = gpu_cores
             self._multicontact_max_items_per_thread = cores_per_unit
             self._multicontact_mpr_state = array_class.get_mpr_state(self._multicontact_n_total_threads)
 
     def _init_multicontact_gjk_state(self):
-        """Kernel 2 GJK state. Must be called after self._gjk is initialized."""
+        """Allocate the GJK scratch state for the multicontact pass.
+
+        Must be called after self._gjk is initialized. Sized to all multicontact threads because any thread may fall
+        back to GJK for its own contact."""
         self._multicontact_gjk_state = array_class.get_gjk_state(
-            self._multicontact_n_gjk_threads,
+            self._multicontact_n_total_threads,
             self._solver._static_rigid_sim_config,
             self._gjk._gjk_info,
             True,
@@ -346,7 +341,8 @@ class Collider:
 
         if n_geoms == 0:
             empty_pairs = np.empty((0, 2), dtype=gs.np_int)
-            return 0, np.full((0, 0), fill_value=-1, dtype=gs.np_int), empty_pairs, False, False, False, False, 0
+            empty_mask = np.zeros((0,), dtype=bool)
+            return 0, np.full((0, 0), -1, dtype=gs.np_int), empty_pairs, False, False, False, False, empty_mask
 
         # Links delegated to IPC coupler (skip pair only when BOTH are IPC-handled)
         ipc_delegated_link_idxs = set()
@@ -572,7 +568,6 @@ class Collider:
             large_contact_mask = large_contact_mask | (
                 (valid_type_a == gs.GEOM_TYPE.BOX) & (valid_type_b == gs.GEOM_TYPE.BOX)
             )
-        n_possible_nonconvex_pairs = int(np.count_nonzero(large_contact_mask))
 
         return (
             n_possible_pairs,
@@ -582,7 +577,7 @@ class Collider:
             has_non_box_plane_convex_convex,
             has_convex_specialization,
             has_nonconvex_vs_nonterrain,
-            n_possible_nonconvex_pairs,
+            large_contact_mask,
         )
 
     def _compute_verts_connectivity(self):
@@ -622,7 +617,8 @@ class Collider:
             self._collider_info.vert_neighbor_start.from_numpy(vert_neighbor_start)
             self._collider_info.vert_n_neighbors.from_numpy(vert_n_neighbors)
 
-    def _init_max_contact_pairs(self, n_possible_pairs, n_possible_nonconvex_pairs):
+    def _init_max_contacts(self, n_possible_pairs, large_contact_pair_mask):
+        n_possible_nonconvex_pairs = int(np.count_nonzero(large_contact_pair_mask))
         max_collision_pairs = min(self._solver.max_collision_pairs, n_possible_pairs)
         # Size the contact buffer per regime: nonconvex pairs each emit up to n_contacts_per_nonconvex_pair, convex and
         # terrain pairs up to n_contacts_per_convex_pair. The worst case fills the capped pair budget with as many
@@ -631,13 +627,47 @@ class Collider:
         cap_convex = self._collider_static_config.n_contacts_per_convex_pair
         n_nonconvex = min(n_possible_nonconvex_pairs, max_collision_pairs)
         n_convex = min(n_possible_pairs - n_possible_nonconvex_pairs, max_collision_pairs - n_nonconvex)
-        max_contact_pairs = n_nonconvex * cap_nonconvex + n_convex * cap_convex
-        max_contact_pairs_broad = max_collision_pairs * self._solver._options.multiplier_collision_broad_phase
+        max_candidate_contacts = n_nonconvex * cap_nonconvex + n_convex * cap_convex
+        max_collision_pairs_broad = max_collision_pairs * self._solver._options.multiplier_collision_broad_phase
+
+        # Post-pruning contact budget for sizing the contact constraint buffers. The physical contact buffer must hold
+        # everything the narrowphase can emit (max_candidate_contacts), but the constraint solver only consumes
+        # contacts surviving link-pair pruning, which keeps roughly the 2D support polygon of each (link_a, link_b)
+        # contact patch. Cap each candidate link pair at _prune_max_contacts_per_link_pair points (or the sum of its
+        # geom-pair caps if smaller) instead of the per-geom-pair worst case. This is a heuristic, not a hard
+        # guarantee: conforming (non-coplanar) contact patches are not pruned and can exceed the cap, which clamps
+        # the contact count and halts the simulation with a request to increase 'max_contacts'. Tightening only pays
+        # off when the worst case is large, so the budget never goes below _prune_max_contacts_floor: under it, the
+        # halt risk buys no meaningful memory savings. The constraint solver overrides this budget at build time when
+        # 'max_contacts' is set.
+        max_contacts = max_candidate_contacts
+        if (
+            self._collider_static_config.has_prunable_contacts
+            and not self._solver._requires_grad
+            and self._solver._options.contact_pruning_tolerance is not None
+        ):
+            geoms_link_idx = np.array([geom.link.idx for geom in self._solver.geoms], dtype=np.int64)
+            pairs_link_idx = geoms_link_idx[self._valid_collision_pairs]
+            pairs_key = self._solver.n_links * pairs_link_idx.min(axis=1) + pairs_link_idx.max(axis=1)
+            _, pairs_group_idx = np.unique(pairs_key, return_inverse=True)
+            pairs_n_contacts = np.where(large_contact_pair_mask, cap_nonconvex, cap_convex)
+            link_pairs_n_contacts = np.bincount(pairs_group_idx, weights=pairs_n_contacts)
+            max_contacts_pruned = np.minimum(link_pairs_n_contacts, self._prune_max_contacts_per_link_pair)
+            max_contacts_pruned_total = max(int(max_contacts_pruned.sum()), self._prune_max_contacts_floor)
+            max_contacts = min(max_contacts, max_contacts_pruned_total)
+
+        # The noslip dual matrix efc_AR is quadratic in the contact budget, so noslip scenes get a much tighter
+        # default cap: measured noslip workloads (manipulation-style scenes) peak below ~70 simultaneous contact
+        # points, while the worst-case candidate budget is orders of magnitude larger. A denser scene hits the
+        # max_contacts clamp and halts with a request to set 'max_contacts' explicitly, which overrides this cap.
+        if self._solver._options.noslip_iterations > 0 and self._solver._options.max_contacts is None:
+            max_contacts = min(max_contacts, self._noslip_max_contacts)
 
         self._collider_info.max_possible_pairs[None] = n_possible_pairs
         self._collider_info.max_collision_pairs[None] = max_collision_pairs
-        self._collider_info.max_collision_pairs_broad[None] = max_contact_pairs_broad
-        self._collider_info.max_contact_pairs[None] = max_contact_pairs
+        self._collider_info.max_collision_pairs_broad[None] = max_collision_pairs_broad
+        self._collider_info.max_candidate_contacts[None] = max_candidate_contacts
+        self._collider_info.max_contacts[None] = max_contacts
 
     def _init_terrain_state(self):
         if self._collider_static_config.has_terrain:
@@ -677,15 +707,21 @@ class Collider:
                     first_time[envs_idx] = True
 
             normal = qd_to_torch(self._collider_state.contact_cache.normal, copy=False)
+            penetration = qd_to_torch(self._collider_state.contact_cache.penetration, copy=False)
             if isinstance(envs_idx, torch.Tensor) and (not IS_OLD_TORCH or envs_idx.dtype == torch.bool):
                 if envs_idx.dtype == torch.bool:
                     normal.masked_fill_(envs_idx[None, :, None], 0.0)
+                    penetration.masked_fill_(envs_idx[None, :], 0.0)
                 else:
                     normal.scatter_(1, envs_idx[None, :, None].expand((normal.shape[0], -1, 3)), 0.0)
+                    penetration.scatter_(1, envs_idx[None, :].expand((normal.shape[0], -1)), 0.0)
             elif envs_idx is None:
                 normal.zero_()
+                penetration.zero_()
             else:
                 normal[:, envs_idx] = 0.0
+                penetration[:, envs_idx] = 0.0
+
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
             return
@@ -760,7 +796,7 @@ class Collider:
         )
 
     def _call_multicontact(self):
-        narrowphase._func_narrowphase_multicontact_mixed(
+        narrowphase._func_narrowphase_multicontact(
             self._solver.links_state,
             self._solver.links_info,
             self._solver.geoms_state,
@@ -779,9 +815,7 @@ class Collider:
             self._gjk._gjk_info,
             self._gjk._gjk_static_config,
             self._support_field._support_field_info,
-            self._multicontact_gjk_state.diff_contact_input,
             self._solver._errno,
-            self._multicontact_n_gjk_threads,
             self._multicontact_n_total_threads,
             self._multicontact_max_items_per_thread,
         )
@@ -833,8 +867,6 @@ class Collider:
                 self._solver._B,
                 self._contact0_n_chunks,
             )
-            self._call_multicontact()
-            narrowphase._func_prepare_gjk_rerun(self._collider_state)
             self._call_multicontact()
         elif self._collider_static_config.has_non_box_plane_convex_convex:
             narrowphase.func_narrow_phase_convex_vs_convex(
@@ -914,26 +946,26 @@ class Collider:
         # SMs (the serial fused kernel wins above that threshold).
         ran_fused_dedup_coop = (
             gs.backend != gs.cpu
-            and self._collider_static_config.has_prunable_contacts
             and not self._solver._static_rigid_sim_config.requires_grad
+            and self._collider_static_config.has_prunable_contacts
             and (self._solver._options.contact_pruning_tolerance or 0.0) > 0.0
             and self._solver._B * 2 <= self._gpu_cores
         )
         if ran_fused_dedup_coop:
-            func_clamp_prune_and_sort_contacts_coop(
+            func_clamp_prune_contacts_coop(
                 self._collider_state,
                 self._collider_info,
                 self._solver._rigid_global_info,
-                self._solver._static_rigid_sim_config,
-                self._collider_static_config,
+                self._solver._errno,
             )
         else:
-            func_clamp_prune_and_sort_contacts(
+            func_clamp_prune_contacts(
                 self._collider_state,
                 self._collider_info,
                 self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
                 self._collider_static_config,
+                self._solver._errno,
             )
 
     def get_contacts(self, as_tensor: bool = True, to_torch: bool = True, keep_batch_dim: bool = False):
@@ -967,6 +999,12 @@ class Collider:
                 sort_idx_view = qd_to_torch(self._collider_state.contact_sort_idx, transpose=True, copy=False)
                 gather_idx_flat = sort_idx_view[:, :n_contacts_max]
                 gather_idx_vec = gather_idx_flat.unsqueeze(-1).expand(-1, -1, 3)
+                # Gather indices past each env's n_contacts are stale (the permutation only fills the live range), so
+                # the dense (n_envs, n_contacts_max) tensor has padding columns to reset to the per-field sentinel.
+                # The mask is field-independent, so build it once and broadcast over scalar and vector fields alike.
+                pad_mask = None
+                if as_tensor and n_envs > 0:
+                    pad_mask = torch.arange(n_contacts_max, device=sort_idx_view.device)[None, :] >= n_contacts[:, None]
 
             for key, data in self._contact_data.items():
                 if zerocopy_aligned:
@@ -980,9 +1018,12 @@ class Collider:
                     else:
                         data = tensor_to_array(data)
                 else:
-                    # data shape is (_B, max_contact_pairs) for scalars or (_B, max_contact_pairs, 3) for vectors.
+                    # data shape is (_B, max_candidate_contacts) for scalars, with a trailing 3 axis for vectors.
                     gidx = gather_idx_vec if data.dim() == 3 else gather_idx_flat
                     data = data.gather(dim=1, index=gidx)
+                    if pad_mask is not None:
+                        mask = pad_mask if data.dim() == 2 else pad_mask[..., None]
+                        data.masked_fill_(mask, -1 if data.dtype == gs.tc_int else 0)
                     if n_envs == 0 and not keep_batch_dim:
                         data = data[0]
                     if not to_torch:

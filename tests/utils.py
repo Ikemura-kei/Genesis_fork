@@ -1,3 +1,4 @@
+import base64
 import io
 import numbers
 import os
@@ -24,6 +25,7 @@ import torch
 from httpcore import TimeoutException as HTTPTimeoutException
 from httpx import HTTPError as HTTPXError
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image, UnidentifiedImageError
 from requests.exceptions import HTTPError
 
@@ -37,11 +39,15 @@ from genesis.utils.misc import tensor_to_array
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
 
-HUGGINGFACE_ASSETS_REVISION = "13b6270d302730ca7ca77f7d40b2b2dc897978fb"
-HUGGINGFACE_SNAPSHOT_REVISION = "fe84ed8bdef4866078b9e18456be025008bfafe9"
+HUGGINGFACE_ASSETS_REVISION = "990a727788f11e34ad006c69bf769303b20cb11c"
+HUGGINGFACE_SNAPSHOT_REVISION = "d5341e3da947e0143368af05abf23d5ab9d78c6f"
 
 MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
 IMAGE_EXTENSIONS = (".png", ".jpg")
+
+IMG_STD_ERR_THR = 1.0
+IMG_NUM_ERR_THR = 0.001
+IMG_BLUR_KERNEL_SIZE = 1  # Size of the blur kernel (must be odd)
 
 
 # Get repository "root" path (actually test dir is good enough)
@@ -239,7 +245,7 @@ def get_hf_dataset(
 
             if not has_files:
                 raise HTTPError("No file downloaded.")
-        except (HTTPTimeoutException, HTTPXError, HTTPError, FileNotFoundError, RuntimeError):
+        except (HTTPTimeoutException, HTTPXError, HTTPError, LocalEntryNotFoundError, FileNotFoundError, RuntimeError):
             if i == num_retry - 1:
                 raise
             print(f"Failed to download assets from HuggingFace dataset. Trying again in {retry_delay}s...")
@@ -289,6 +295,68 @@ def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=
 
 def assert_equal(actual, desired, *, err_msg=None):
     assert_allclose(actual, desired, atol=0.0, rtol=0.0, err_msg=err_msg)
+
+
+def assert_pixel_match(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    *,
+    err_msg: str = "Images do not match",
+    verbose: bool = True,
+    std_err_threshold: float = IMG_STD_ERR_THR,
+    ratio_err_threshold: float = IMG_NUM_ERR_THR,
+    blurred_kernel_size: int = IMG_BLUR_KERNEL_SIZE,
+) -> None:
+    """Assert two RGB image arrays match.
+
+    The images match unless the per-channel standard deviation of their blurred difference exceeds
+    ``std_err_threshold`` AND the number of differing pixels exceeds ``ratio_err_threshold`` of the total size.
+    This tolerates the few-pixel jitter that software renderers produce on any platform while still catching a
+    real difference. On mismatch, raise ``AssertionError``; unless ``verbose`` is False, also print the error
+    metrics and a base64-encoded PNG of the per-pixel delta (so the failing frame can be recovered from CI logs).
+    """
+    img_a = np.atleast_3d(np.asarray(img_a)).astype(np.float32)
+    img_b = np.atleast_3d(np.asarray(img_b)).astype(np.float32)
+    if img_a.shape != img_b.shape:
+        raise AssertionError(f"{err_msg} (shape {img_a.shape} != {img_b.shape})")
+
+    # Blur both images with a normalized box kernel to smooth anti-aliasing edges before comparing.
+    blurred = []
+    for img_arr in (img_a, img_b):
+        if blurred_kernel_size == 1:
+            blurred.append(img_arr)
+            continue
+        kernel = np.ones((blurred_kernel_size, blurred_kernel_size), dtype=np.float32) / (blurred_kernel_size**2)
+        pad_size = blurred_kernel_size // 2
+        h, w = img_arr.shape[:2]
+        padded = np.pad(img_arr, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)), mode="edge")
+        blurred_arr = np.zeros_like(img_arr, dtype=np.float32)
+        for c in range(img_arr.shape[-1]):
+            for i in range(h):
+                for j in range(w):
+                    blurred_arr[i, j, c] = np.sum(
+                        padded[i : i + blurred_kernel_size, j : j + blurred_kernel_size, c] * kernel
+                    )
+        blurred.append(blurred_arr)
+
+    img_err = np.minimum(np.abs(blurred[1] - blurred[0]), 255).astype(np.uint8)
+    std_err = float(np.max(np.std(img_err.reshape((-1, img_err.shape[-1])), axis=0)))
+    ratio_err = int((np.abs(img_err) > np.finfo(np.float32).eps).sum())
+    if not (std_err > std_err_threshold and ratio_err > ratio_err_threshold * img_err.size):
+        return
+
+    if verbose:
+        print(
+            f"Image mismatch [std_err={std_err:.2f} (thr={std_err_threshold:.2f}), "
+            f"ratio_err={ratio_err} (thr={ratio_err_threshold * img_err.size})]:"
+        )
+        raw_bytes = io.BytesIO()
+        img_delta = np.minimum(np.abs(img_b - img_a), 255).astype(np.uint8)
+        img_obj = Image.fromarray(img_delta.squeeze(-1) if img_delta.shape[-1] == 1 else img_delta)
+        img_obj.save(raw_bytes, "PNG")
+        raw_bytes.seek(0)
+        print(base64.b64encode(raw_bytes.read()))
+    raise AssertionError(err_msg)
 
 
 def init_simulators(gs_sim, mj_sim=None, qpos=None, qvel=None):
@@ -478,8 +546,8 @@ def _get_model_mappings(
             if mj_geom.contype or mj_geom.conaffinity:
                 mj_geoms_idx.append(mj_geom.id)
 
-    (gs_joints_idx, gs_q_idx, gs_dofs_idx) = _gs_search_by_joints_name(gs_sim.scene, joints_name)
-    (_, _, gs_motors_idx) = _gs_search_by_joints_name(gs_sim.scene, motors_name)
+    gs_joints_idx, gs_q_idx, gs_dofs_idx = _gs_search_by_joints_name(gs_sim.scene, joints_name)
+    _, _, gs_motors_idx = _gs_search_by_joints_name(gs_sim.scene, motors_name)
 
     gs_bodies_idx = _gs_search_by_links_name(gs_sim.scene, bodies_name)
     gs_geoms_idx: list[int] = []
@@ -559,7 +627,6 @@ def build_genesis_sim(
             camera_lookat=(0.0, 0.0, 0.5),
             camera_fov=30,
             res=(960, 640),
-            max_FPS=60,
         ),
         sim_options=gs.options.SimOptions(
             dt=mj_sim.model.opt.timestep,
@@ -640,8 +707,8 @@ def check_mujoco_model_consistency(
 
     # Get mapping between Mujoco and Genesis
     gs_maps, mj_maps = _get_model_mappings(gs_sim, mj_sim, joints_name, bodies_name)
-    (gs_bodies_idx, gs_joints_idx, gs_q_idx, gs_dofs_idx, gs_geoms_idx, gs_motors_idx) = gs_maps
-    (mj_bodies_idx, mj_joints_idx, mj_qs_idx, mj_dofs_idx, mj_geoms_idx, mj_motors_idx) = mj_maps
+    gs_bodies_idx, gs_joints_idx, gs_q_idx, gs_dofs_idx, gs_geoms_idx, gs_motors_idx = gs_maps
+    mj_bodies_idx, mj_joints_idx, mj_qs_idx, mj_dofs_idx, mj_geoms_idx, mj_motors_idx = mj_maps
 
     # solver
     gs_gravity = gs_sim.rigid_solver.scene.gravity
@@ -816,8 +883,8 @@ def check_mujoco_data_consistency(
 ):
     # Get mapping between Mujoco and Genesis
     gs_maps, mj_maps = _get_model_mappings(gs_sim, mj_sim, joints_name, bodies_name)
-    (gs_bodies_idx, _, gs_q_idx, gs_dofs_idx, _, _) = gs_maps
-    (mj_bodies_idx, _, mj_qs_idx, mj_dofs_idx, _, _) = mj_maps
+    gs_bodies_idx, _, gs_q_idx, gs_dofs_idx, _, _ = gs_maps
+    mj_bodies_idx, _, mj_qs_idx, mj_dofs_idx, _, _ = mj_maps
 
     # crb
     gs_crb_inertial = gs_sim.rigid_solver.links_state.crb_inertial.to_numpy()[:, 0].reshape([-1, 9])[

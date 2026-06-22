@@ -611,8 +611,15 @@ PointCloudTactileSensorMetadataMixinT = TypeVar(
 
 
 class PointCloudTactileSensorMixin(ProbeSensorMixin[PointCloudTactileSensorMetadataMixinT]):
-    def __init__(self, sensor_options: "SensorOptions", sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: "SensorOptions",
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
         self._debug_objects: list = []
         self._probe_start_idx = -1
         self._debug_pc_chunks: list[tuple[int, torch.Tensor, torch.Tensor]] | None = None
@@ -693,8 +700,8 @@ class PointCloudTactileSensorMixin(ProbeSensorMixin[PointCloudTactileSensorMetad
                 active_mask = tensor_to_array(active_envs_mask[:, envs_idx].T).astype(bool)
                 if not active_mask.any():
                     continue
-                trk_pos = trk_link.get_pos(envs_idx)[:, None, :]
-                trk_quat = trk_link.get_quat(envs_idx)[:, None, :]
+                trk_pos = trk_link.get_pos(envs_idx, relative=False)[:, None, :]
+                trk_quat = trk_link.get_quat(envs_idx, relative=False)[:, None, :]
                 pc_world = gu.transform_by_trans_quat(pos_local[None, :, :], trk_pos, trk_quat)
                 pc_world = tensor_to_array(pc_world) + env_offsets[:, None, :]
                 world_chunks.append(pc_world[active_mask])
@@ -703,8 +710,8 @@ class PointCloudTactileSensorMixin(ProbeSensorMixin[PointCloudTactileSensorMetad
                 pos_active = pos_local[active_mask]
                 if pos_active.numel() == 0:
                     continue
-                trk_pos = trk_link.get_pos(envs_idx).reshape(3)
-                trk_quat = trk_link.get_quat(envs_idx).reshape(4)
+                trk_pos = trk_link.get_pos(envs_idx, relative=False).reshape(3)
+                trk_quat = trk_link.get_quat(envs_idx, relative=False).reshape(4)
                 world_chunks.append(tensor_to_array(gu.transform_by_trans_quat(pos_active, trk_pos, trk_quat)))
         if not world_chunks:
             return
@@ -723,7 +730,7 @@ class PointCloudTactileSensorMixin(ProbeSensorMixin[PointCloudTactileSensorMetad
         return tensor_to_array(values[:, envs_idx].T)
 
 
-class ProximityTaxelData(NamedTuple):
+class ProximityTaxelReturnType(NamedTuple):
     """Per-taxel estimates in link-local frame."""
 
     force: torch.Tensor
@@ -742,7 +749,7 @@ class ProximityTaxelSensor(
     PointCloudTactileSensorMixin[ProximityTaxelMetadata],
     ProbesWithNormalSensorMixin[ProximityTaxelMetadata],
     RigidSensorMixin[ProximityTaxelMetadata],
-    SimpleSensor[ProximityTaxelOptions, ProximityTaxelMetadata, ProximityTaxelData],
+    SimpleSensor[ProximityTaxelOptions, None, ProximityTaxelMetadata, ProximityTaxelReturnType],
 ):
     """Spherical point-cloud taxels: per-taxel force and torque in link-local frame vs tracked meshes."""
 
@@ -783,6 +790,7 @@ class ProximityTaxelSensor(
     @classmethod
     def _update_current_timestep_data(
         cls,
+        shared_context: None,
         shared_metadata: ProximityTaxelMetadata,
         current_ground_truth_data_T: torch.Tensor,
         ground_truth_data_timeline: "TensorRingBuffer | None",
@@ -1535,18 +1543,25 @@ class ElastomerTaxelSensor(
     PointCloudTactileSensorMixin[ElastomerTaxelSensorMetadata],
     ProbesWithNormalSensorMixin[ElastomerTaxelSensorMetadata],
     RigidSensorMixin[ElastomerTaxelSensorMetadata],
-    SimpleSensor[ElastomerTaxelSensorOptions, ElastomerTaxelSensorMetadata],
+    SimpleSensor[ElastomerTaxelSensorOptions, None, ElastomerTaxelSensorMetadata],
 ):
-    def __init__(self, sensor_options: ElastomerTaxelSensorOptions, sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: ElastomerTaxelSensorOptions,
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
 
         self._is_grid = self._probe_local_pos.ndim > 2
         self._shape = self._probe_local_pos.shape[:-1]
 
         (probe_pos, probe_normals, use_grid_fft, grid_normal, grid_tangent_u, grid_tangent_v, grid_spacing) = (
             _normalize_elastomer_probe_layout(
-                np.asarray(sensor_options.probe_local_pos, dtype=gs.np_float),
-                np.asarray(sensor_options.probe_local_normal, dtype=gs.np_float),
+                np.asarray(options.probe_local_pos, dtype=gs.np_float),
+                np.asarray(options.probe_local_normal, dtype=gs.np_float),
                 self._is_grid,
             )
         )
@@ -1745,6 +1760,7 @@ class ElastomerTaxelSensor(
     @classmethod
     def _update_current_timestep_data(
         cls,
+        shared_context: None,
         shared_metadata: ElastomerTaxelSensorMetadata,
         current_ground_truth_data_T: torch.Tensor,
         ground_truth_data_timeline: "TensorRingBuffer | None",

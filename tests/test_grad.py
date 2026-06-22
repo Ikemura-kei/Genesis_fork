@@ -10,6 +10,7 @@ from genesis.utils import set_random_seed
 from .utils import assert_allclose
 
 
+@pytest.mark.slow  # ~350s
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_differentiable_push(show_viewer):
@@ -344,7 +345,9 @@ def test_diff_solver(monkeypatch):
             entities_info=rigid_solver.entities_info,
             constraint_state=constraint_solver.constraint_state,
             rigid_global_info=rigid_solver._rigid_global_info,
+            island_state=constraint_solver.island_state,
             static_rigid_sim_config=rigid_solver._static_rigid_sim_config,
+            is_decomposed=False,
         )
         func_solve_body(
             entities_info=rigid_solver.entities_info,
@@ -354,6 +357,7 @@ def test_diff_solver(monkeypatch):
             rigid_global_info=rigid_solver._rigid_global_info,
             static_rigid_sim_config=rigid_solver._static_rigid_sim_config,
             _n_iterations=constraint_solver._n_iterations,
+            island_state=constraint_solver.island_state,
         )
 
     monkeypatch.setattr(constraint_solver, "resolve", constraint_solver_resolve)
@@ -373,7 +377,7 @@ def test_diff_solver(monkeypatch):
         entities_info=rigid_solver.entities_info,
         rigid_global_info=rigid_solver._rigid_global_info,
         static_rigid_sim_config=rigid_solver._static_rigid_sim_config,
-        contact_island_state=constraint_solver.contact_island.contact_island_state,
+        island_state=constraint_solver.island_state,
         is_forward_pos_updated=True,
         is_forward_vel_updated=True,
         is_backward=False,
@@ -585,6 +589,7 @@ def test_differentiable_rigid(show_viewer):
     assert_allclose(loss, 0.0, atol=1e-2)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_diff_sim_vs_solver_state_grad_parity(show_viewer):

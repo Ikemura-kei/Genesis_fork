@@ -51,9 +51,11 @@ def get_model_name(file_path):
     OSError
         If there is an error reading the file.
     """
-    path = os.path.join(get_assets_dir(), file_path)
-    tree = ET.parse(path)
-    root = tree.getroot()
+    try:
+        # Inline XML content parses directly; a file path does not and falls back to reading from disk.
+        root = ET.fromstring(file_path)
+    except ET.ParseError:
+        root = ET.parse(os.path.join(get_assets_dir(), file_path)).getroot()
     if root.tag == "mujoco":
         return root.attrib.get("model")
     return None
@@ -82,8 +84,9 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
             # Best guess for the search path
             asset_path = os.path.dirname(path) if is_valid_path else os.getcwd()
 
-            # Detect whether it is a URDF file or a Mujoco MJCF file
-            root = xml.getroot()
+            # Detect whether it is a URDF file or a Mujoco MJCF file. `ET.parse` yields an ElementTree, while
+            # `ET.fromstring` (inline XML content) yields the root Element directly.
+            root = xml.getroot() if isinstance(xml, ET.ElementTree) else xml
             is_urdf_file = root.tag == "robot"
             mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
 
@@ -220,7 +223,7 @@ def parse_xml(morph, surface):
     l_infos, links_j_infos = parse_links(mj, morph.scale)
 
     # Re-order kinematic tree info
-    l_infos, links_j_infos, links_g_infos, _ = uu._order_links(l_infos, links_j_infos, links_g_infos)
+    l_infos, links_j_infos, links_g_infos, _ = uu.order_links_depth_first(l_infos, links_j_infos, links_g_infos)
 
     # Parsing all equality constraints
     eqs_info = parse_equalities(mj, morph.scale)
@@ -550,30 +553,40 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         vert_start = mj_mesh.vertadr[0]
         vert_end = vert_start + mj_mesh.vertnum[0]
 
+        norm_start = int(mj.mesh_normaladr[mj_mesh.id])
+        norm_end = norm_start + int(mj.mesh_normalnum[mj_mesh.id])
+
         face_start = mj_mesh.faceadr[0]
         face_end = face_start + mj_mesh.facenum[0]
 
         vertices = mj.mesh_vert[vert_start:vert_end]
-        normals = mj.mesh_normal[vert_start:vert_end]
+        normals = mj.mesh_normal[norm_start:norm_end]
         faces = mj.mesh_face[face_start:face_end]
+        norm_faces = mj.mesh_facenormal[face_start:face_end]
 
         tex_vert_start = int(mj.mesh_texcoordadr[mj_mesh.id])
         tex_vert_end = tex_vert_start + int(mj.mesh_texcoordnum[mj_mesh.id])
 
+        # MuJoCo stores vertices, normals and texcoords in independently-addressed blocks, with each face
+        # carrying separate vertex/normal/texcoord index triplets. Split shared vertices so that every unique
+        # (vertex, normal[, texcoord]) combination becomes a single trimesh vertex.
+        index_faces = [faces.ravel(), norm_faces.ravel()]
         if tex_vert_start != -1:  # -1 means no texcoord
             tex_faces = mj.mesh_facetexcoord[face_start:face_end]
             uv = mj.mesh_texcoord[tex_vert_start:tex_vert_end]
             uv[:, 1] = 1 - uv[:, 1]
-
-            pairs = np.stack([faces.ravel(), tex_faces.ravel()], axis=1)  # (face_num * 3, 2)
-            uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
-
-            vertices = vertices[uniq[:, 0]]
-            normals = normals[uniq[:, 0]]
-            uv = uv[uniq[:, 1]]
-            faces = inv.reshape(-1, 3).astype(np.int64)
+            index_faces.append(tex_faces.ravel())
         else:
             uv = None
+
+        pairs = np.stack(index_faces, axis=1)  # (face_num * 3, 2 or 3)
+        uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
+
+        vertices = vertices[uniq[:, 0]]
+        normals = normals[uniq[:, 1]]
+        if uv is not None:
+            uv = uv[uniq[:, 2]]
+        faces = inv.reshape(-1, 3).astype(np.int64)
 
         mesh_params = dict(vertices=vertices, faces=faces, vertex_normals=normals)
         gs_type = gs.GEOM_TYPE.MESH

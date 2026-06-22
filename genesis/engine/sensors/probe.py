@@ -50,11 +50,18 @@ ProbeSensorSharedMetadataT = TypeVar("ProbeSensorSharedMetadataT", bound=ProbeSe
 class ProbeSensorMixin(Generic[ProbeSensorSharedMetadataT]):
     """Shared logic for registering this sensor's probes in ``ProbeSensorMetadataMixin`` fields."""
 
-    def __init__(self, sensor_options: "SensorOptions", sensor_idx: int, sensor_manager: "SensorManager"):
+    def __init__(
+        self,
+        options: "SensorOptions",
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
         # `_get_return_format` runs inside `super().__init__`, so `_probe_local_pos` / `_n_probes` must already be set.
-        self._probe_local_pos = torch.tensor(sensor_options.probe_local_pos, dtype=gs.tc_float, device=gs.device)
+        self._probe_local_pos = torch.tensor(options.probe_local_pos, dtype=gs.tc_float, device=gs.device)
         self._n_probes = int(np.prod(self._probe_local_pos.shape[:-1]))
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
 
     def build(self) -> None:
         super().build()
@@ -111,8 +118,8 @@ class ProbeSensorMixin(Generic[ProbeSensorSharedMetadataT]):
             envs_idx = list(context.rendered_envs_idx)
             n_debug_envs = len(envs_idx)
             env_offsets = context.scene.envs_offset[np.asarray(envs_idx, dtype=gs.np_int)]
-            link_pos = self._link.get_pos(envs_idx)[:, None, :]
-            link_quat = self._link.get_quat(envs_idx)[:, None, :]
+            link_pos = self._link.get_pos(envs_idx, relative=False)[:, None, :]
+            link_quat = self._link.get_quat(envs_idx, relative=False)[:, None, :]
             probe_world = gu.transform_by_trans_quat(
                 self._probe_local_pos.reshape(-1, 3)[None, :, :], link_pos, link_quat
             )
@@ -121,8 +128,8 @@ class ProbeSensorMixin(Generic[ProbeSensorSharedMetadataT]):
             envs_idx = None
             n_debug_envs = 1
             env_offsets = None
-            link_pos = self._link.get_pos(envs_idx).reshape(3)
-            link_quat = self._link.get_quat(envs_idx).reshape(4)
+            link_pos = self._link.get_pos(envs_idx, relative=False).reshape(3)
+            link_quat = self._link.get_quat(envs_idx, relative=False).reshape(4)
             probe_world = tensor_to_array(
                 gu.transform_by_trans_quat(self._probe_local_pos.reshape(-1, 3), link_pos, link_quat)
             )
@@ -144,8 +151,15 @@ ProbesWithNormalSensorSharedMetadataT = TypeVar(
 class ProbesWithNormalSensorMixin(ProbeSensorMixin[ProbesWithNormalSensorSharedMetadataT]):
     """Probe sensor whose probes carry a per-probe outward normal in link-local frame."""
 
-    def __init__(self, sensor_options: "SensorOptions", sensor_idx: int, sensor_manager: "SensorManager"):
-        super().__init__(sensor_options, sensor_idx, sensor_manager)
+    def __init__(
+        self,
+        options: "SensorOptions",
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
         self._probe_local_normal = torch.tensor(self._options.probe_local_normal, dtype=gs.tc_float, device=gs.device)
         if self._probe_local_normal.ndim == 1:
             self._probe_local_normal = self._probe_local_normal.expand(self._n_probes, 3).contiguous()

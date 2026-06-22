@@ -28,6 +28,7 @@ except ImportError:
     ENABLE_MADRONA = False
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 1])
 def test_rasterizer_non_batched(n_envs, show_viewer):
@@ -192,6 +193,7 @@ def test_rasterizer_non_batched(n_envs, show_viewer):
     assert_allclose(cam_move_dist_offset_T, cam_move_dist, atol=1e-2)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_rasterizer_batched(show_viewer, png_snapshot):
     CAM_RES = (128, 128)
@@ -239,10 +241,17 @@ def test_rasterizer_batched(show_viewer, png_snapshot):
     assert data.rgb.dtype == torch.uint8
     assert (data.rgb[0] != data.rgb[1]).any(), "Frames should be different"
 
+    # Ground-truth per-env identity (independent of any screen-axis assumption): env 1's sphere sits closer to the
+    # camera (x=1 vs x=0), so it must cover strictly more pixels at its own batch index. A reversed batched read would
+    # place the larger sphere at index 0 and fail this.
+    sphere_px = [int(((data.rgb[i][..., 0].int() - data.rgb[i][..., 1].int()) > 40).sum()) for i in range(scene.n_envs)]
+    assert sphere_px[1] > sphere_px[0], f"data.rgb index must match env index; got per-env sphere pixels {sphere_px}"
+
     for i in range(scene.n_envs):
         assert rgb_array_to_png_bytes(data.rgb[i]) == png_snapshot
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_rasterizer_attached_batched(show_viewer, png_snapshot, tol):
     png_snapshot.extension._std_err_threshold = 1.1
@@ -626,6 +635,7 @@ def test_raytracer(n_envs, png_snapshot):
             assert rgb_array_to_png_bytes(data.rgb) == png_snapshot
 
 
+@pytest.mark.slow  # ~250s
 @pytest.mark.required
 def test_camera_lookat_entity(show_viewer, png_snapshot):
     scene = gs.Scene(show_viewer=show_viewer)

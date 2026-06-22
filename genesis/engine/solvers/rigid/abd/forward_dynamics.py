@@ -20,14 +20,15 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.array_class as array_class
 from .misc import (
-    func_wakeup_entity_and_its_temp_island,
+    func_wakeup_island,
     func_check_index_range,
     func_add_safe_backward,
+    linear_to_lower_tri,
 )
 
-# Block size (warp width) for the cooperative mass_mat_assemble path. Used only when constraint_layout_transposed=True
-# (and not use_hibernation). One warp per (entity, env); lanes stride i_d_ within the entity dof block to coalesce the
-# flipped mass_mat writes.
+# Block size (warp width) for the cooperative mass_mat_assemble path. Used only when
+# enable_cooperative_constraint_kernels=True (and not use_hibernation). One warp per (entity, env); lanes stride i_d_
+# within the entity dof block to coalesce the flipped mass_mat writes.
 _MASS_MAT_BLOCK = 32
 
 
@@ -142,7 +143,7 @@ def func_forward_dynamics(
     geoms_state: array_class.GeomsState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
     is_backward: qd.template(),
 ):
     func_compute_mass_matrix(
@@ -176,7 +177,7 @@ def func_forward_dynamics(
         geoms_state=geoms_state,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
-        contact_island_state=contact_island_state,
+        island_state=island_state,
         is_backward=is_backward,
     )
     func_update_acc(
@@ -226,7 +227,7 @@ def kernel_forward_dynamics(
     geoms_state: array_class.GeomsState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
 ):
     func_forward_dynamics(
         links_state=links_state,
@@ -239,7 +240,7 @@ def kernel_forward_dynamics(
         geoms_state=geoms_state,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
-        contact_island_state=contact_island_state,
+        island_state=island_state,
         is_backward=False,
     )
 
@@ -380,7 +381,9 @@ def func_compute_mass_matrix(
                         dofs_state.cdof_ang[i_d, i_b],
                     )
 
-    if qd.static(static_rigid_sim_config.constraint_layout_transposed and not static_rigid_sim_config.use_hibernation):
+    if qd.static(
+        static_rigid_sim_config.enable_cooperative_constraint_kernels and not static_rigid_sim_config.use_hibernation
+    ):
         # Cooperative warp-per-(entity, env) writer over the lower triangle (inclusive of diagonal). Each cell's
         # symmetric value is computed once via the sqrt-formula compressed pair index and written to both
         # `[i_d, j_d, i_b]` and `[j_d, i_d, i_b]` inline, saving the upper-tri dot products that the previous
@@ -405,18 +408,23 @@ def func_compute_mass_matrix(
             i_pair = tid
             while i_pair < n_lower_tri:
                 # Compressed lower-tri-inclusive index (matches tiled func_factor_mass): i_pair = i_d_ * (i_d_ + 1) / 2
-                # + j_d_, with j_d_ in [0, i_d_].
-                i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
-                j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                # + j_d_, with j_d_ in [0, i_d_]. The fast-math-robust inversion is required here: a raw sqrt drops the
+                # j=0 entry of every perfect-square row on GPU, leaving M missing long-range coupling -> indefinite.
+                i_d_, j_d_ = linear_to_lower_tri(i_pair)
                 i_d = d_s + i_d_
                 j_d = d_s + j_d_
-                val = (
-                    dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
-                    + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
-                ) * rigid_global_info.mass_parent_mask[i_d, j_d]
-                rigid_global_info.mass_mat[i_d, j_d, i_b] = val
-                if i_d_ != j_d_:
-                    rigid_global_info.mass_mat[j_d, i_d, i_b] = val
+                # The mass matrix is block-diagonal per kinematic tree, so only within-block (j_d in i_d's block) pairs
+                # can be non-zero. Skipping cross-block pairs avoids their dot products; those entries stay zero
+                # (mass_mat is zeroed and nothing else writes them). This makes the assemble cost scale with the sum of
+                # per-tree blocks instead of the whole (possibly multi-body) entity.
+                if j_d >= rigid_global_info.dofs_mass_block_start[i_d]:
+                    val = (
+                        dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
+                        + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
+                    ) * rigid_global_info.mass_parent_mask[i_d, j_d]
+                    rigid_global_info.mass_mat[i_d, j_d, i_b] = val
+                    if i_d_ != j_d_:
+                        rigid_global_info.mass_mat[j_d, i_d, i_b] = val
                 i_pair += _T
     else:
         qd.loop_config(
@@ -441,28 +449,28 @@ def func_compute_mass_matrix(
                         else i_0
                     )
 
-                    for i_d, j_d in qd.ndrange(
-                        (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
-                        (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
-                    ):
-                        rigid_global_info.mass_mat[i_d, j_d, i_b] = (
-                            dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
-                            + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
-                        ) * rigid_global_info.mass_parent_mask[i_d, j_d]
+                    for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                        for j_d in range(
+                            rigid_global_info.dofs_mass_block_start[i_d], rigid_global_info.dofs_mass_block_end[i_d]
+                        ):
+                            rigid_global_info.mass_mat[i_d, j_d, i_b] = (
+                                dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
+                                + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
+                            ) * rigid_global_info.mass_parent_mask[i_d, j_d]
 
                     for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-                        for j_d in range(i_d + 1, entities_info.dof_end[i_e]):
+                        for j_d in range(i_d + 1, rigid_global_info.dofs_mass_block_end[i_d]):
                             rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
 
     # Take into account motor armature
-    qd.loop_config(name="armature", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    qd.loop_config(name="armature", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_d, i_b in qd.ndrange(dofs_state.f_ang.shape[0], links_state.pos.shape[1]):
         I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
         func_add_safe_backward(rigid_global_info.mass_mat, (i_d, i_d, i_b), dofs_info.armature[I_d], BW)
 
     # Take into account first-order correction terms for implicit integration scheme right away
     if qd.static(implicit_damping):
-        qd.loop_config(name="impint_order_1_corr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(name="impint_order_1_corr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
         for i_d, i_b in qd.ndrange(dofs_state.f_ang.shape[0], links_state.pos.shape[1]):
             I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
             rigid_global_info.mass_mat[i_d, i_d, i_b] = (
@@ -511,6 +519,12 @@ def func_factor_mass(
                 i_b = i // (BLOCK_DIM * n_entities)
                 if i_b >= _B:
                     continue
+                # Skip hibernated entities: their mass matrix is unchanged, so the factor from the last awake step
+                # stays valid. The slot remaps to an awake entity, so the work scales with the awake entity count.
+                if qd.static(static_rigid_sim_config.use_hibernation):
+                    if i_e >= rigid_global_info.n_awake_entities[i_b]:
+                        continue
+                    i_e = rigid_global_info.awake_entities[i_e, i_b]
 
                 if rigid_global_info.mass_mat_mask[i_e, i_b]:
                     entity_dof_start = entities_info.dof_start[i_e]
@@ -520,10 +534,14 @@ def func_factor_mass(
                     pivot_row = qd.simt.block.SharedArray((MAX_DOFS_PER_ENTITY,), gs.qd_float)
 
                     # Copy the lower triangle of M into mass_mat_L (+ implicit damping on the diagonal), cooperatively.
+                    # The mass matrix is block-diagonal per kinematic tree, so only the within-block lower triangle is
+                    # non-zero; restricting to it makes the factorization cost the sum of per-tree cubes instead of the
+                    # whole (possibly multi-body) entity cube. Cross-block entries stay zero (mass_mat_L is zeroed).
                     i_d_ = tid
                     while i_d_ < n_dofs:
                         i_d = entity_dof_start + i_d_
-                        for j_d in range(entity_dof_start, i_d + 1):
+                        block_start = rigid_global_info.dofs_mass_block_start[i_d]
+                        for j_d in range(block_start, i_d + 1):
                             rigid_global_info.mass_mat_L[i_d, j_d, i_b] = rigid_global_info.mass_mat[i_d, j_d, i_b]
                         if qd.static(implicit_damping):
                             I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
@@ -540,18 +558,20 @@ def func_factor_mass(
                         i_d_ = i_d_ + BLOCK_DIM
                     qd.simt.block.sync()
 
-                    # In-place LDL^T, eliminating dofs from last to first (matches the scalar branch).
+                    # In-place LDL^T, eliminating dofs from last to first (matches the scalar branch). Each pivot only
+                    # touches the trailing submatrix within its own block, so blocks factor independently.
                     for j in range(n_dofs):
-                        i_d_ = n_dofs - j - 1
                         i_d = entity_dof_end - j - 1
+                        block_start = rigid_global_info.dofs_mass_block_start[i_d]
+                        i_d_local = i_d - block_start
                         D_inv = 1.0 / rigid_global_info.mass_mat_L[i_d, i_d, i_b]
                         if tid == 0:
                             rigid_global_info.mass_mat_D_inv[i_d, i_b] = D_inv
 
                         # Phase A: snapshot the (Schur-updated) pivot-row entries below the diagonal into shared.
                         j_d_ = tid
-                        while j_d_ < i_d_:
-                            pivot_row[j_d_] = rigid_global_info.mass_mat_L[i_d, entity_dof_start + j_d_, i_b]
+                        while j_d_ < i_d_local:
+                            pivot_row[j_d_] = rigid_global_info.mass_mat_L[i_d, block_start + j_d_, i_b]
                             j_d_ = j_d_ + BLOCK_DIM
                         qd.simt.block.sync()
 
@@ -559,13 +579,12 @@ def func_factor_mass(
                         # submatrix from the read-only snapshot. Distinct rows per lane => no write conflicts, and
                         # the pivot row is only read (from shared) => no read/write race on row i_d.
                         j_d_ = tid
-                        while j_d_ < i_d_:
+                        while j_d_ < i_d_local:
                             a = pivot_row[j_d_] * D_inv
-                            j_d = entity_dof_start + j_d_
+                            j_d = block_start + j_d_
                             for k_d_ in range(j_d_ + 1):
-                                rigid_global_info.mass_mat_L[j_d, entity_dof_start + k_d_, i_b] = (
-                                    rigid_global_info.mass_mat_L[j_d, entity_dof_start + k_d_, i_b]
-                                    - a * pivot_row[k_d_]
+                                rigid_global_info.mass_mat_L[j_d, block_start + k_d_, i_b] = (
+                                    rigid_global_info.mass_mat_L[j_d, block_start + k_d_, i_b] - a * pivot_row[k_d_]
                                 )
                             rigid_global_info.mass_mat_L[i_d, j_d, i_b] = a
                             j_d_ = j_d_ + BLOCK_DIM
@@ -578,14 +597,22 @@ def func_factor_mass(
             not static_rigid_sim_config.enable_tiled_cholesky_mass_matrix or static_rigid_sim_config.backend == gs.cpu
         ):
             qd.loop_config(name="factor_mass", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
-            for i_e, i_b in qd.ndrange(n_entities, _B):
+            for i_slot, i_b in qd.ndrange(n_entities, _B):
+                # Skip hibernated entities: their mass matrix is unchanged, so the factor from the last awake step
+                # stays valid. This makes the factorization cost scale with the awake entity count.
+                i_e = i_slot
+                if qd.static(static_rigid_sim_config.use_hibernation):
+                    if i_slot >= rigid_global_info.n_awake_entities[i_b]:
+                        continue
+                    i_e = rigid_global_info.awake_entities[i_slot, i_b]
                 if rigid_global_info.mass_mat_mask[i_e, i_b]:
                     entity_dof_start = entities_info.dof_start[i_e]
                     entity_dof_end = entities_info.dof_end[i_e]
                     n_dofs = entities_info.n_dofs[i_e]
 
                     for i_d in range(entity_dof_start, entity_dof_end):
-                        for j_d in range(entity_dof_start, i_d + 1):
+                        block_start = rigid_global_info.dofs_mass_block_start[i_d]
+                        for j_d in range(block_start, i_d + 1):
                             rigid_global_info.mass_mat_L[i_d, j_d, i_b] = rigid_global_info.mass_mat[i_d, j_d, i_b]
 
                         if qd.static(implicit_damping):
@@ -603,13 +630,14 @@ def func_factor_mass(
 
                     for i_d_ in range(n_dofs):
                         i_d = entity_dof_end - i_d_ - 1
+                        block_start = rigid_global_info.dofs_mass_block_start[i_d]
                         D_inv = 1.0 / rigid_global_info.mass_mat_L[i_d, i_d, i_b]
                         rigid_global_info.mass_mat_D_inv[i_d, i_b] = D_inv
 
-                        for j_d_ in range(i_d - entity_dof_start):
+                        for j_d_ in range(i_d - block_start):
                             j_d = i_d - j_d_ - 1
                             a = rigid_global_info.mass_mat_L[i_d, j_d, i_b] * D_inv
-                            for k_d in range(entity_dof_start, j_d + 1):
+                            for k_d in range(block_start, j_d + 1):
                                 rigid_global_info.mass_mat_L[j_d, k_d, i_b] -= (
                                     a * rigid_global_info.mass_mat_L[i_d, k_d, i_b]
                                 )
@@ -629,6 +657,12 @@ def func_factor_mass(
                 i_b = i // (BLOCK_DIM * n_entities)
                 if i_b >= _B:
                     continue
+                # Skip hibernated entities: their mass matrix is unchanged, so the factor from the last awake step
+                # stays valid. The slot remaps to an awake entity, so the work scales with the awake entity count.
+                if qd.static(static_rigid_sim_config.use_hibernation):
+                    if i_e >= rigid_global_info.n_awake_entities[i_b]:
+                        continue
+                    i_e = rigid_global_info.awake_entities[i_e, i_b]
 
                 if rigid_global_info.mass_mat_mask[i_e, i_b]:
                     entity_dof_start = entities_info.dof_start[i_e]
@@ -640,8 +674,7 @@ def func_factor_mass(
 
                     i_pair = tid
                     while i_pair < n_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                        i_d_, j_d_ = linear_to_lower_tri(i_pair)
                         i_d = entity_dof_start + i_d_
                         j_d = entity_dof_start + j_d_
                         mass_mat[i_d_, j_d_] = rigid_global_info.mass_mat[i_d, j_d, i_b]
@@ -668,6 +701,9 @@ def func_factor_mass(
                     for j in range(n_dofs):
                         i_d_ = n_dofs - j - 1
                         i_d = entity_dof_end - j - 1
+                        # Block-local lower bound (in entity-local shared-memory indices): the mass matrix is
+                        # block-diagonal per kinematic tree, so each pivot only eliminates within its own block.
+                        block_start_ = rigid_global_info.dofs_mass_block_start[i_d] - entity_dof_start
 
                         D_inv = 1.0 / mass_mat[i_d_, i_d_]
                         if tid == 0:
@@ -676,9 +712,9 @@ def func_factor_mass(
                             rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
 
                         j_d_ = i_d_ - 1 - tid
-                        while j_d_ >= 0:
+                        while j_d_ >= block_start_:
                             a = mass_mat[i_d_, j_d_] * D_inv
-                            for k_d in range(j_d_ + 1):
+                            for k_d in range(block_start_, j_d_ + 1):
                                 mass_mat[j_d_, k_d] = mass_mat[j_d_, k_d] - a * mass_mat[i_d_, k_d]
                             mass_mat[i_d_, j_d_] = a
                             j_d_ = j_d_ - BLOCK_DIM
@@ -693,8 +729,7 @@ def func_factor_mass(
                     i_pair = tid
                     n_strict_lower_tri = n_dofs * (n_dofs - 1) // 2
                     while i_pair < n_strict_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) + 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ - 1) // 2
+                        i_d_, j_d_ = linear_to_lower_tri(i_pair, strict=True)
                         i_d = entity_dof_start + i_d_
                         j_d = entity_dof_start + j_d_
                         rigid_global_info.mass_mat_L[i_d, j_d, i_b] = mass_mat[i_d_, j_d_]
@@ -808,7 +843,7 @@ def func_solve_mass_entity(
             if qd.static(BW):
                 out_bw[0, i_d, i_b] = vec[i_d, i_b]
 
-            for j_d in range(i_d + 1, entity_dof_end):
+            for j_d in range(i_d + 1, rigid_global_info.dofs_mass_block_end[i_d]):
                 # Since we read out[j_d, i_b], and j_d > i_d, which means that out[j_d, i_b] is already
                 # finalized at this point, we don't need to care about AD mutation rule.
                 if qd.static(BW):
@@ -834,7 +869,7 @@ def func_solve_mass_entity(
             if qd.static(BW):
                 curr_out = out_bw[1, i_d, i_b]
 
-            for j_d in range(entity_dof_start, i_d):
+            for j_d in range(rigid_global_info.dofs_mass_block_start[i_d], i_d):
                 curr_out = curr_out - rigid_global_info.mass_mat_L[i_d, j_d, i_b] * out[j_d, i_b]
 
             out[i_d, i_b] = curr_out
@@ -896,13 +931,13 @@ def func_torque_and_passive_force(
     geoms_state: array_class.GeomsState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
     is_backward: qd.template(),
 ):
     BW = qd.static(is_backward)
 
     # compute force based on each dof's ctrl mode
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_e, i_b in qd.ndrange(entities_info.n_links.shape[0], dofs_state.ctrl_mode.shape[1]):
         EPS = rigid_global_info.EPS[None]
 
@@ -990,19 +1025,24 @@ def func_torque_and_passive_force(
                             wakeup = True
 
         if qd.static(static_rigid_sim_config.use_hibernation):
-            if entities_state.hibernated[i_e, i_b] and wakeup:
-                # TODO: migrate this function
-                func_wakeup_entity_and_its_temp_island(
-                    i_e,
-                    i_b,
-                    entities_state,
-                    entities_info,
-                    dofs_state,
-                    links_state,
-                    geoms_state,
-                    rigid_global_info,
-                    contact_island_state,
-                )
+            if wakeup:
+                # Actuation may target any sleeping component of this entity; wake each one's island (a single call
+                # revives the whole island, so already-awake links are skipped).
+                for i_l in range(entities_info.link_start[i_e], entities_info.link_end[i_e]):
+                    if links_state.is_hibernated[i_l, i_b]:
+                        func_wakeup_island(
+                            island_state.links_island_idx[i_l, i_b],
+                            i_b,
+                            entities_state,
+                            entities_info,
+                            links_info,
+                            dofs_state,
+                            links_state,
+                            geoms_state,
+                            rigid_global_info,
+                            island_state,
+                            static_rigid_sim_config,
+                        )
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_0, i_b in (
@@ -1234,7 +1274,7 @@ def func_update_force(
                         func_add_safe_backward(links_state.cfrc_ang, I_p, links_state.cfrc_ang[i_l, i_b], BW)
 
     # Clear coupling forces after use
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for I in qd.grouped(qd.ndrange(*links_state.cfrc_coupling_ang.shape)):
         links_state.cfrc_coupling_ang[I] = qd.Vector.zero(gs.qd_float, 3)
         links_state.cfrc_coupling_vel[I] = qd.Vector.zero(gs.qd_float, 3)
@@ -1245,7 +1285,7 @@ def func_actuation(self):
     if qd.static(self._use_hibernation):
         pass
     else:
-        qd.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l, i_b in qd.ndrange(self.n_links, self._B):
             I_l = [i_l, i_b] if qd.static(self._options.batch_links_info) else i_l
             for i_j in range(self.links_info.joint_start[I_l], self.links_info.joint_end[I_l]):
@@ -1506,7 +1546,7 @@ def kernel_forward_dynamics_without_qacc(
     geoms_state: array_class.GeomsState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
     is_backward: qd.template(),
 ):
     func_compute_mass_matrix(
@@ -1540,7 +1580,7 @@ def kernel_forward_dynamics_without_qacc(
         geoms_state=geoms_state,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
-        contact_island_state=contact_island_state,
+        island_state=island_state,
         is_backward=is_backward,
     )
     func_update_acc(
@@ -1597,7 +1637,7 @@ def func_implicit_damping(
         for i_e, i_b in qd.ndrange(n_entities, _B):
             rigid_global_info.mass_mat_mask[i_e, i_b] = False
 
-        qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+        qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
         for i_e, i_b in qd.ndrange(n_entities, _B):
             entity_dof_start = entities_info.dof_start[i_e]
             entity_dof_end = entities_info.dof_end[i_e]

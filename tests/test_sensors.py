@@ -69,7 +69,7 @@ def test_lazy_sensor_discovery(show_viewer, tmp_path):
             pass
 
 
-        class FakeSensor(Sensor[FakeSensorOptions, FakeSensorMetadata]):
+        class FakeSensor(Sensor[FakeSensorOptions, None, FakeSensorMetadata]):
             def _get_return_format(self):
                 return (1,)
 
@@ -79,7 +79,7 @@ def test_lazy_sensor_discovery(show_viewer, tmp_path):
 
             @classmethod
             def _update_shared_cache(
-                cls, metadata, gt_cache, ground_truth_data_timeline, measured_data_timeline, intermediate_cache,
+                cls, context, metadata, gt_cache, ground_truth_data_timeline, measured_data_timeline, intermediate_cache,
             ):
                 pass
 
@@ -182,7 +182,7 @@ def test_pipeline_contract(tol):
         transform_alpha: tuple[float, ...] = (0.0,)
         hardware_imp: tuple[float, ...] = (0.0,)
 
-    class FakePipelineSensor(SimpleSensor[FakeOptions, FakeMetadata]):
+    class FakePipelineSensor(SimpleSensor[FakeOptions, None, FakeMetadata]):
         def _get_return_format(self):
             return (len(self._options.physics_imp),)
 
@@ -211,7 +211,7 @@ def test_pipeline_contract(tol):
             shared_metadata.step_counter = 0
 
         @classmethod
-        def _update_raw_data(cls, metadata, raw_data_T):
+        def _update_raw_data(cls, context, metadata, raw_data_T):
             # Same scalar raw value across all components and envs; per-component divergence is introduced by the
             # downstream hook vectors. 1-indexed step.
             metadata.step_counter += 1
@@ -261,7 +261,7 @@ def test_pipeline_contract(tol):
     class FakeSimpleOptions(SimpleSensorOptions["FakeSimpleSensor"]):
         pass
 
-    class FakeSimpleSensor(SimpleSensor[FakeSimpleOptions, FakeSimpleMetadata]):
+    class FakeSimpleSensor(SimpleSensor[FakeSimpleOptions, None, FakeSimpleMetadata]):
         def _get_return_format(self):
             return (1,)
 
@@ -275,7 +275,7 @@ def test_pipeline_contract(tol):
             shared_metadata.step_counter = 0
 
         @classmethod
-        def _update_raw_data(cls, metadata, raw_data_T):
+        def _update_raw_data(cls, context, metadata, raw_data_T):
             metadata.step_counter += 1
             raw_data_T.fill_(float(metadata.step_counter))
 
@@ -375,7 +375,7 @@ def test_pipeline_contract_uint8_delay(tol):
     class FakeQuantizedOptions(SimpleSensorOptions["FakeQuantizedSensor"]):
         pass
 
-    class FakeQuantizedSensor(SimpleSensor[FakeQuantizedOptions, FakeQuantizedMetadata]):
+    class FakeQuantizedSensor(SimpleSensor[FakeQuantizedOptions, None, FakeQuantizedMetadata]):
         def _get_return_format(self):
             return (1,)
 
@@ -393,7 +393,7 @@ def test_pipeline_contract_uint8_delay(tol):
             shared_metadata.step_counter = 0
 
         @classmethod
-        def _update_raw_data(cls, metadata, raw_data_T):
+        def _update_raw_data(cls, context, metadata, raw_data_T):
             metadata.step_counter += 1
             raw_data_T.fill_(float(metadata.step_counter))
 
@@ -421,6 +421,7 @@ def test_pipeline_contract_uint8_delay(tol):
     assert_equal(observed, expected)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_add_and_read_all_registered_sensors():
     """Add all sensors into scene and read them, verifying SensorManager cache and tensor contiguity"""
@@ -732,6 +733,7 @@ def test_sensor_history_length_contact_and_imu(show_viewer, tol, n_envs):
 # ------------------------------------------------------------------------------------------
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_contact_sensors_gravity_force(n_envs, show_viewer, tol):
@@ -894,6 +896,7 @@ def test_contact_sensors_gravity_force(n_envs, show_viewer, tol):
     assert_allclose(force_sensor_noisy.read()[..., 2], -GRAVITY / 2, tol=gs.EPS)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_contact_sensor_filter_link_idx(show_viewer):
     """Contact sensor filter_link_idx ignores contacts whose other participant is a listed link."""
@@ -948,6 +951,51 @@ def test_contact_sensor_filter_link_idx(show_viewer):
 # ------------------------------------------------------------------------------------------
 # ------------------------------------ Raycast Sensors -------------------------------------
 # ------------------------------------------------------------------------------------------
+
+
+@pytest.mark.required
+def test_shared_context(show_viewer):
+    # Raycaster and DepthCamera are distinct sensor types that both cast against the scene geometry; they must share
+    # one RaycastContext (a single BVH set) instead of each building its own. A sensor type declaring no context (IMU)
+    # must resolve to None.
+    from genesis.engine.sensors.raycaster import RaycastContext
+
+    scene = gs.Scene(show_viewer=show_viewer)
+    scene.add_entity(gs.morphs.Plane())
+    box = scene.add_entity(gs.morphs.Box(size=(0.4, 0.4, 0.4), pos=(0.0, 0.0, 1.0)))
+
+    raycaster = scene.add_sensor(
+        gs.sensors.Raycaster(
+            pattern=gs.sensors.raycaster.GridPattern(resolution=0.2, size=(0.4, 0.4), direction=(0.0, 0.0, -1.0)),
+            pos_offset=(0.0, 0.0, 2.0),
+        )
+    )
+    depth_camera = scene.add_sensor(
+        gs.sensors.DepthCamera(
+            pattern=gs.sensors.raycaster.DepthCameraPattern(res=(4, 4)),
+            pos_offset=(0.0, 0.0, 2.0),
+        )
+    )
+    imu = scene.add_sensor(gs.sensors.IMU(entity_idx=box.idx))
+    scene.build()
+
+    contexts = list(raycaster._manager._shared_contexts.values())
+    # Exactly one shared context instance, of type RaycastContext.
+    assert len(contexts) == 1
+    assert isinstance(contexts[0], RaycastContext)
+    # Both raycast-casting sensor types resolve to that single instance, so they cast against the very same BVH list
+    # (one collision BVH, not one built per sensor type).
+    assert raycaster._shared_context is contexts[0]
+    assert depth_camera._shared_context is contexts[0]
+    assert raycaster._shared_context.bvh_contexts is depth_camera._shared_context.bvh_contexts
+    assert len(raycaster._shared_context.bvh_contexts) == 1
+    # A sensor type that declares no context resolves to None.
+    assert imu._shared_context is None
+
+    # Functional smoke: both casters return finite hit distances after a step.
+    scene.step()
+    assert torch.isfinite(raycaster.read().distances).all()
+    assert torch.isfinite(depth_camera.read_image()).all()
 
 
 @pytest.mark.required
@@ -1230,7 +1278,7 @@ def test_raycaster_against_visual(tmp_path, show_viewer, n_envs, kin_raycastable
 
     # Every entity is fixed, so each visual BVH is static (maybe_static) and rebuilt only when a GEOMETRY change is
     # pending; nothing is pending after the baseline step, so an idle step would rebuild none of them.
-    visual_entries = [entry for entry in cam_kin._shared_metadata.solver_bvhs if entry.raycast_mask is not None]
+    visual_entries = [entry for entry in cam_kin._shared_context.bvh_contexts if entry.raycast_mask is not None]
     assert visual_entries and all(entry.maybe_static for entry in visual_entries)
     assert all(not entry.rebuild_subscriber.pending for entry in visual_entries)
 
@@ -1337,7 +1385,7 @@ def test_lidar_bvh_parallel_env(show_viewer, tol):
 
     # All links are fixed, so the collision BVH is static: rebuilt only when a set_pos invalidates it, never on an
     # ordinary step. The per-env obstacle geometry differs here, so it cannot be shared across envs.
-    collision_bvh = next(entry for entry in lidar._shared_metadata.solver_bvhs if entry.raycast_mask is None)
+    collision_bvh = next(entry for entry in lidar._shared_context.bvh_contexts if entry.raycast_mask is None)
     assert collision_bvh.maybe_static
     assert not collision_bvh.shared_across_envs
 
@@ -1426,12 +1474,13 @@ def test_raycaster_heterogeneous_object(show_viewer, tol):
         )
     )
     # Without per-env geom masking an env casts against the union of all variants (they share one vertex buffer). The
-    # variants overlap (same pose) so env 0's inactive variant is the nearer hit there - that is what makes a missing
-    # mask observable: env 0 would shadow its own box with env 1's closer sphere.
+    # variants are concentric obstacles of decreasing near-face distance, so each env's own variant is the farthest
+    # hit. A missing mask is then observable as an env shadowing its variant with a nearer one belonging to another env.
     het_obstacle = scene.add_entity(
         morph=(
             gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(1.0, 0.0, 0.5), fixed=True),
             gs.morphs.Sphere(radius=0.2, pos=(1.0, 0.0, 0.5), fixed=True),
+            gs.morphs.Box(size=(0.6, 0.6, 0.6), pos=(1.0, 0.0, 0.5), fixed=True),
         ),
     )
     lidar = scene.add_sensor(
@@ -1443,14 +1492,14 @@ def test_raycaster_heterogeneous_object(show_viewer, tol):
         )
     )
 
-    scene.build(n_envs=2)
+    scene.build(n_envs=3)
     scene.step()
 
     distances = lidar.read().distances[:, 0, 0]
-    assert_allclose(distances, (0.9, 0.8), tol=5e-3)
+    assert_allclose(distances, (0.9, 0.8, 0.7), tol=5e-3)
 
     # The per-env trees differ (each masks the other variant), so the cast must not share one tree across envs.
-    collision_bvh = next(entry for entry in lidar._shared_metadata.solver_bvhs if entry.raycast_mask is None)
+    collision_bvh = next(entry for entry in lidar._shared_context.bvh_contexts if entry.raycast_mask is None)
     assert collision_bvh.maybe_static
     assert not collision_bvh.shared_across_envs
 
@@ -1649,6 +1698,7 @@ def test_temperature_grid_simulate_all_link_temps(show_viewer, tol, n_envs):
     assert_allclose(torch.mean(sensor2.read()), link_temps[..., cold_link_idx], tol=2e-2)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_surface_distance_sensor_box_sphere(show_viewer, tol, n_envs):
@@ -1776,6 +1826,7 @@ def _as_env_batch(data, n_envs: int) -> torch.Tensor:
 # ------------------------------------------------------------------------------------------
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_kinematic_contact_probe_box_sphere_support(show_viewer, tol, n_envs):
@@ -2140,6 +2191,7 @@ def test_elastomer_sensor_grid_box_sphere(show_viewer, tol, n_envs):
     assert_equal(combined_sensor.read_ground_truth(), 0.0, err_msg="ElastomerTaxel should be zero in air.")
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_proximity_sensor_box_on_box(show_viewer, tol, n_envs):

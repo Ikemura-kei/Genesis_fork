@@ -9,6 +9,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.array_class as array_class
+import genesis.utils.geom as gu
 from genesis.engine.entities import DroneEntity, RigidEntity
 from genesis.engine.entities.base_entity import Entity
 from genesis.engine.states import QueriedStates, RigidSolverState
@@ -28,9 +29,9 @@ from genesis.utils.misc import (
 from genesis.utils.sdf import SDF
 
 from ..base_solver import Solver, StateChange, mutates
-from ..kinematic_solver import KinematicSolver
+from ..kinematic_solver import KinematicSolver, _select_links_offset, _offset_world_shift, _fill_base_link_geom_offsets
 from .collider import Collider
-from .constraint import ConstraintSolver, ConstraintSolverIsland
+from .constraint import ConstraintSolver
 from .abd.misc import (
     func_add_safe_backward,
     func_apply_coupling_force,
@@ -41,7 +42,6 @@ from .abd.misc import (
     func_check_index_range,
     func_clear_external_force,
     func_read_field_if,
-    func_wakeup_entity_and_its_temp_island,
     func_write_field_if,
     func_write_and_read_field_if,
     kernel_init_invweight,
@@ -73,7 +73,6 @@ from .abd.forward_kinematics import (
     func_forward_velocity_entity,
     func_forward_velocity_batch,
     func_forward_velocity,
-    func_hibernate_entity_and_zero_dof_velocities,
     func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer,
     func_update_geoms_entity,
     func_update_geoms_batch,
@@ -128,6 +127,9 @@ from .abd.accessor import (
     kernel_set_links_COM_shift,
     kernel_set_links_inertial_mass,
     kernel_wake_up_entities_by_links,
+    kernel_wake_up_entities_by_dofs,
+    kernel_wake_up_entities_by_qs,
+    kernel_wake_up_entities_on_new_contact,
     kernel_set_geoms_friction_ratio,
     kernel_set_qpos,
     kernel_set_global_sol_params,
@@ -248,16 +250,23 @@ class RigidSolver(KinematicSolver):
         self._requires_grad = self._sim.options.requires_grad
         self._enable_heterogeneous = False  # Set to True when any entity has heterogeneous morphs
 
+        # Contact islands are off by default (opt in explicitly). The gate further below still disables them under
+        # requires_grad (the differentiable adjoint reads the dense global Hessian) and for single-island scenes
+        # (where the partition is pure overhead, unless hibernation needs it).
         self._use_contact_island = options.use_contact_island
-        self._use_hibernation = options.use_hibernation and options.use_contact_island
-        if options.use_hibernation and not options.use_contact_island:
-            gs.logger.warning(
-                "`use_hibernation` is set to False because `use_contact_island=False`. Please set "
-                "`use_contact_island=True` if you want to use hibernation"
+        # Hibernation builds on islands, so requesting it without islands is a genuine conflict.
+        self._use_hibernation = options.use_hibernation
+        if self._use_hibernation and not self._use_contact_island:
+            gs.raise_exception(
+                "`use_hibernation=True` requires `use_contact_island=True`, as hibernation builds on islands."
             )
 
-        self._hibernation_thresh_vel = options.hibernation_thresh_vel
-        self._hibernation_thresh_acc = options.hibernation_thresh_acc
+        # Resolve the hibernation velocity tolerance to the residual-velocity floor of the float precision: 32-bit
+        # contact solves leave a larger resting-velocity jitter than 64-bit, so a body settles below a coarser floor.
+        if options.hibernation_thresh_vel is None:
+            self._hibernation_thresh_vel = 5e-3 if gs.qd_float == qd.f32 else 1e-4
+        else:
+            self._hibernation_thresh_vel = options.hibernation_thresh_vel
 
         self._sol_min_timeconst = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
         self._sol_default_timeconst = max(options.constraint_timeconst, self._sol_min_timeconst)
@@ -361,6 +370,23 @@ class RigidSolver(KinematicSolver):
         self._init_collider()
         self._init_constraint_solver()
 
+        # Morph pose offset of each collision geom, conjugated into the geom's own frame so the relative getters
+        # revert it for geoms rotated relative to the link. Each root link carries its own offset; child-link geoms
+        # inherit it through the kinematic chain and keep an identity offset. Forward offset device tensors, None when
+        # everything is identity; the relative geom getters recompute the inverse.
+        geoms_offset_pos = np.zeros((self.n_geoms, 3), dtype=gs.np_float)
+        geoms_offset_quat = np.tile(gu.identity_quat(), (self.n_geoms, 1))
+        for entity in self._entities:
+            ranges = entity.base_link._variant_geom_ranges if entity._variant_offset_pos is not None else None
+            _fill_base_link_geom_offsets(geoms_offset_pos, geoms_offset_quat, entity, entity.geoms, ranges)
+        self._geoms_offset_pos = self._geoms_offset_quat = None
+        if not (
+            np.allclose(geoms_offset_pos, 0.0, atol=gs.EPS)
+            and np.allclose(gu.quat_to_xyz(geoms_offset_quat), 0.0, atol=gs.EPS)
+        ):
+            self._geoms_offset_pos = torch.from_numpy(geoms_offset_pos).to(device=gs.device, dtype=gs.tc_float)
+            self._geoms_offset_quat = torch.from_numpy(geoms_offset_quat).to(device=gs.device, dtype=gs.tc_float)
+
         # FIXME: when the migration is finished, we will remove the about two lines
         self._func_vel_at_point = func_vel_at_point
         self._func_apply_coupling_force = func_apply_coupling_force
@@ -381,47 +407,36 @@ class RigidSolver(KinematicSolver):
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
 
-    def _should_transpose_constraint_layout(self) -> bool:
-        """Decide whether to allocate the layout-flippable constraint-state with layout=(1, 0).
-
-        The transposed layout (plus its companion cooperative kernels) wins on workloads with enough per-env compute
-        density to amortize the warp-per-env overhead, and loses when envs are sparse and many: in those cases the
-        legacy 1-thread-per-env path is already coalesced under (len_constraints_, _B) and warp scheduling dominates.
-
-        Empirical pattern from `perso_hugh/doc/linesearch_shuffle.md` (Exp 5):
-          - Wins (>+3%): dex_hand, g1_fall, box_pyramid_3..6; all 4096 envs, n_dofs >= ~18.
-          - Wash / regression: anymal/franka families; 30000 envs, n_dofs <= ~12.
-
-        Heuristic: enable transpose when both (a) n_envs is small enough that env-parallelism does not already
-        saturate the GPU, and (b) per-env DoF count is large enough to keep a 32-lane warp busy on the cooperative
-        reductions.
-        """
-        if gs.backend == gs.cpu or self.sim.options.requires_grad:
-            return False
-        # Sparse solve relies on jac_dofs_idx / jac_n_dofs to skip irrelevant dofs in the constraint
-        # update. The cooperative qfrc kernel that pairs with the flipped layout is dense-only, and several other
-        # kernels that read jac under the flipped layout (e.g. the refinement-phase _func_update_qfrc_constraint_per_dof)
-        # would also need sparse-aware rewrites.
-        if self._options.sparse_solve:
-            return False
-        n_envs = self._sim._B
-        n_dofs = self.n_dofs
-        return n_envs <= 8192 and n_dofs >= 16
-
     def _build_static_config(self):
+        # The scene has multi-island block structure when it holds several independent DOF-carrying bodies or free
+        # joints (the Hessian then splits into per-island blocks instead of one dense tree). This gates both the CPU
+        # skyline solver and the GPU per-island force below: a single dense-coupled tree (e.g. one big robot) is one
+        # island and gains nothing from either.
+        n_dof_entities = sum(entity.n_dofs > 0 for entity in self.entities)
+        n_free_joints = sum(joint.type == gs.JOINT_TYPE.FREE for joint in self.joints)
+        has_multi_island_structure = n_dof_entities >= 2 or n_free_joints >= 2
+
+        # Islands only reduce work when the scene splits into several blocks. With a single dense-coupled tree (one
+        # island) the partition is pure overhead, so disable it in computation even if the user opted in. Hibernation
+        # is the exception: it builds on the island partition (the per-island is_hibernated flags), so it keeps islands
+        # on even for a single island, which then takes the serial tile-fallback path. The differentiable solve reads
+        # the dense global Hessian (nt_H), not the per-island tiles, so islands stay off under requires_grad regardless.
+        self._use_contact_island = (
+            self._use_contact_island
+            and (has_multi_island_structure or self._use_hibernation)
+            and not self._requires_grad
+        )
+
+        # Hibernation builds on the island partition, so it cannot outlive islands being turned off by any gate above.
+        # Re-sync it to the final island decision so the two never disagree.
+        self._use_hibernation = self._use_hibernation and self._use_contact_island
+
         # sparse_solve=None resolves automatically: the skyline-envelope solver pays off on CPU only when the scene
-        # has block structure (several DOF-carrying bodies or free joints keep the Hessian band much tighter than
-        # n_dofs), whereas a single dense-coupled tree gains nothing and pays the per-step envelope tax. An explicit
-        # value overrides this. On GPU the envelope factorization is dropped (the dense tiled path is faster there);
-        # an explicit True still enables the assembly-level sparsity, with a warning.
+        # has block structure, whereas a single dense-coupled tree gains nothing and pays the per-step envelope tax. An
+        # explicit value overrides this. On GPU the envelope factorization is dropped (the dense tiled path is faster
+        # there); an explicit True still enables the assembly-level sparsity, with a warning.
         if self._options.sparse_solve is None:
-            n_dof_entities = sum(entity.n_dofs > 0 for entity in self.entities)
-            n_free_joints = sum(joint.type == gs.JOINT_TYPE.FREE for joint in self.joints)
-            sparse_solve = (
-                gs.backend == gs.cpu
-                and not self._enable_mujoco_compatibility
-                and (n_dof_entities >= 2 or n_free_joints >= 2)
-            )
+            sparse_solve = gs.backend == gs.cpu and not self._enable_mujoco_compatibility and has_multi_island_structure
         else:
             sparse_solve = self._options.sparse_solve
             if sparse_solve and gs.backend != gs.cpu:
@@ -430,10 +445,55 @@ class RigidSolver(KinematicSolver):
                     "factorization is faster there. Use with caution."
                 )
 
+        # sparse-skyline and per-island exploit the block-diagonal Hessian from complementary angles, so on CPU
+        # they COMPOSE rather than compete: islands give each block its own cheap Hessian factorization, while the
+        # sparse Jacobian representation makes the per-iteration Jacobian-vector products, the constraint-to-island
+        # lookup, and the Hessian assembly cost O(nonzeros) instead of O(n_constraints * n_dofs). With both on, the
+        # many-small-bodies solve scales near-linearly in body count (measured ~2.7x faster than sparse alone and
+        # ~8x faster than islands alone at 256 boxes); the island Hessian branch naturally bypasses the skyline
+        # envelope factorization. The differentiable adjoint solve reads the dense Hessian, so the composition is
+        # restricted to the forward (non-grad) path. On GPU the dense tiled path is faster, so sparse is dropped and
+        # islands stand alone.
+        if gs.backend == gs.cpu and self._use_contact_island and sparse_solve and not self.sim.options.requires_grad:
+            pass  # compose islands + sparse Jacobian
+        elif sparse_solve and gs.backend == gs.cpu:
+            self._use_contact_island = False
+        elif self._use_contact_island:
+            sparse_solve = False
+
         # The skyline-envelope factorization and its DOF reorder are CPU-only and incompatible with the differentiable
         # adjoint solve (which reuses nt_H with natural, dense indexing). Under requires_grad only the assembly-level
-        # sparsity applies, matching the pre-existing behaviour.
-        sparse_envelope = sparse_solve and gs.backend == gs.cpu and not self.sim.options.requires_grad
+        # sparsity applies, matching the pre-existing behaviour. When islands are also active (the CPU composition),
+        # the per-island Hessian branch factorizes each block directly and never reads the skyline envelope, so the
+        # O(n_dofs^2) per-step envelope computation would be pure waste - drop it and let islands own the factorization.
+        sparse_envelope = (
+            sparse_solve
+            and gs.backend == gs.cpu
+            and not self.sim.options.requires_grad
+            and not self._use_contact_island
+        )
+
+        # The layout-flippable constraint-state tensors are stored batch-first either for the GPU cooperative kernels or
+        # under serialized execution, where the env loop is outermost and per-env rows must be contiguous to avoid
+        # stride-n_envs access. Batched sweeps key their iteration-axis order on the same flag, so that iteration order
+        # always follows the physical layout.
+        #
+        # The subgroup-cooperative constraint kernels (and the batch-first layout they expect) win when per-env compute
+        # density amortizes the warp-per-env overhead, and lose when envs are sparse and many (the 1-thread-per-env path
+        # is already coalesced under (len_constraints_, _B)). They are also the layout the decomposed solve arm requires.
+        # Empirically the cooperative path wins around 4096 envs at n_dofs >= ~18 and washes out by ~30000 envs at
+        # n_dofs <= ~12; the n_envs <= 8192 and n_dofs >= 16 thresholds bound that crossover. Sparse solve is excluded
+        # (the cooperative qfrc kernel and the flipped-layout jac readers are dense-only).
+        enable_cooperative_constraint_kernels = (
+            gs.backend != gs.cpu
+            and not self.sim.options.requires_grad
+            and not self._options.sparse_solve
+            and self._sim._B <= 8192
+            and self.n_dofs >= 16
+        )
+        constraint_layout_batch_first = (
+            enable_cooperative_constraint_kernels or self.sim._para_level < gs.PARA_LEVEL.ALL
+        )
 
         static_rigid_sim_config = dict(
             backend=gs.backend,
@@ -449,6 +509,11 @@ class RigidSolver(KinematicSolver):
             enable_collision=self._enable_collision,
             enable_joint_limit=self._enable_joint_limit,
             box_box_detection=self._box_box_detection,
+            use_contact_island=self._use_contact_island,
+            # The per-island solve engages wherever islands are on by default (CPU, where it composes with the sparse
+            # skyline). The GPU block below narrows it to exclude the whole-env-fits-shared no-hibernation case, which
+            # factors faster through the whole-env path (its block-diagonal Cholesky is the exact per-island result).
+            enable_per_island_solve=self._use_contact_island,
             sparse_solve=sparse_solve,
             sparse_envelope=sparse_envelope,
             integrator=self._integrator,
@@ -458,7 +523,8 @@ class RigidSolver(KinematicSolver):
             parallel_init=(
                 gs.backend != gs.cpu and not self.sim.options.requires_grad and self.n_envs <= get_gpu_core_count()
             ),
-            constraint_layout_transposed=self._should_transpose_constraint_layout(),
+            enable_cooperative_constraint_kernels=enable_cooperative_constraint_kernels,
+            constraint_layout_batch_first=constraint_layout_batch_first,
         )
 
         # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
@@ -486,6 +552,18 @@ class RigidSolver(KinematicSolver):
                 cholesky_tile_size = 16 if (self.n_dofs <= 16 or 32 < self.n_dofs <= 48) else 32
                 tiled_n_dofs = max(math.ceil(self.n_dofs / cholesky_tile_size), 1) * cholesky_tile_size
                 tiled_n_dofs_per_entity = max(math.ceil(max_n_dofs_per_entity / 32), 1) * 32
+
+                # The decomposed arm's cooperative per-island solve stages one island's tile in shared memory.
+                # Size it to the largest tile-size multiple that fits shared (precision-aware), but no larger
+                # than tiled_n_dofs; an island exceeding this falls back to the serial per-island solve. Unlike
+                # hessian_fits_shared (which sizes the whole-env tile and is often False for big envs), this is
+                # always usable because islands are small - it only caps how big a single island may be before
+                # it loses the cooperative path.
+                tiled_n_island_dofs = tiled_n_dofs
+                while tiled_n_island_dofs > cholesky_tile_size and not fits_in_gpu_shared_memory(
+                    tiled_n_island_dofs, tiled_n_island_dofs
+                ):
+                    tiled_n_island_dofs -= cholesky_tile_size
 
                 # enable_tiled_cholesky_hessian selects the register-streaming tiled factor (no shared-memory cap):
                 # worth tiling from n_dofs >= 16, and below the shared cap only when envs undersaturate (above it the
@@ -521,9 +599,28 @@ class RigidSolver(KinematicSolver):
                     hessian_fits_shared=hessian_fits_shared,
                     cholesky_tile_size=cholesky_tile_size,
                     enable_fused_factor_solve_init=enable_fused_factor_solve_init,
+                    enable_per_island_solve=(
+                        self._use_contact_island and (self._use_hibernation or not hessian_fits_shared)
+                    ),
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
+                    tiled_n_island_dofs=tiled_n_island_dofs,
+                    # Persistent block grid for the cooperative per-island factor+solve: enough T-lane blocks to fill the
+                    # GPU (one block ~= one tile = cholesky_tile_size lanes). The blocks grid-stride over the (env,
+                    # island) work-list, so a small batch with many islands fans out across blocks instead of
+                    # serializing inside one block-per-env. The count is independent of the body/env count (only the GPU
+                    # size and cholesky_tile_size, which already varies the kernels via n_dofs): an ndarray-mode kernel
+                    # must compile once and run for any n_objs/n_envs, and a block with no work exits at the grid-stride
+                    # guard (blk >= work_size) within the same scheduling wave, so over-launching a tiny work-list is free.
+                    island_factor_n_blocks=max(1, max_tiled_envs // cholesky_tile_size),
                 )
+
+                # Manually pin the solve arm only where the winner is determinable in advance AND confirmed across
+                # CUDA + Metal; genuinely backend-dependent cases fall through to the per-step autotuner.
+                if not enable_cooperative_constraint_kernels:
+                    # No cooperative layout (n_envs > 8192 already saturates the GPU, or n_dofs < 16): the decomposed
+                    # arm has nothing to exploit, so the scalar one-thread-per-env monolith is the clear winner.
+                    static_rigid_sim_config["prefer_decomposed_solver"] = 0
 
             # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
             if self.sim.options.requires_grad:
@@ -541,13 +638,6 @@ class RigidSolver(KinematicSolver):
                 )
 
         self._static_rigid_sim_config = array_class.RigidSimStaticConfig(**static_rigid_sim_config)
-
-        if self._static_rigid_sim_config.use_hibernation:
-            if gs.use_ndarray:
-                gs.raise_exception(
-                    "Hibernation is not yet supported with dynamic array mode. "
-                    "Please set performance_mode=True or use_hibernation=False."
-                )
 
         if self._static_rigid_sim_config.requires_grad:
             if self._static_rigid_sim_config.use_hibernation:
@@ -780,6 +870,36 @@ class RigidSolver(KinematicSolver):
                 j_l = self.links[j_l].parent_idx
         self._rigid_global_info.mass_parent_mask.from_numpy(mass_parent_mask)
 
+        # Partition each entity's DOFs into contiguous, independently-factorable blocks. The mass matrix is
+        # block-diagonal across kinematic trees, so the per-block bounds let the assemble/factor/solve restrict to one
+        # tree's DOFs instead of the whole (possibly multi-free-body) entity. Trees are merged into one block only when
+        # their DOF intervals interleave (so a block stays a contiguous range); a single-tree entity yields one block
+        # spanning the whole entity, leaving its behavior unchanged.
+        links_by_idx = {link.idx: link for link in self.links}
+        tree_lo: dict[int, int] = {}
+        tree_hi: dict[int, int] = {}
+        for link in self.links:
+            if link.n_dofs == 0:
+                continue
+            root = link
+            while root.parent_idx != -1:
+                root = links_by_idx[root.parent_idx]
+            tree_lo[root.idx] = min(tree_lo.get(root.idx, link.dof_start), link.dof_start)
+            tree_hi[root.idx] = max(tree_hi.get(root.idx, link.dof_end), link.dof_end)
+        block_start = np.arange(self.n_dofs_, dtype=gs.np_int)
+        block_end = np.arange(1, self.n_dofs_ + 1, dtype=gs.np_int)
+        merged: list[list[int]] = []
+        for lo, hi in sorted(zip(tree_lo.values(), tree_hi.values())):
+            if merged and lo < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        for lo, hi in merged:
+            block_start[lo:hi] = lo
+            block_end[lo:hi] = hi
+        self._rigid_global_info.dofs_mass_block_start.from_numpy(block_start)
+        self._rigid_global_info.dofs_mass_block_end.from_numpy(block_end)
+
         self._rigid_global_info.gravity.from_numpy(self.gravity)
 
     def _dispatch_heterogeneous_vgeoms(self):
@@ -973,8 +1093,6 @@ class RigidSolver(KinematicSolver):
                 equalities_info=self.equalities_info,
                 static_rigid_sim_config=self._static_rigid_sim_config,
             )
-            if self._use_contact_island:
-                gs.logger.warn("contact island is not supported for equality constraints yet")
 
     def _init_collider(self):
         self.collider = Collider(self)
@@ -1008,10 +1126,8 @@ class RigidSolver(KinematicSolver):
             self.terrain_xyz_maxmin.from_numpy(xyz_maxmin)
 
     def _init_constraint_solver(self):
-        if self._use_contact_island:
-            self.constraint_solver = ConstraintSolverIsland(self)
-        else:
-            self.constraint_solver = ConstraintSolver(self)
+        # Islands are a per-island Newton solve inside ConstraintSolver.resolve, gated on use_contact_island.
+        self.constraint_solver = ConstraintSolver(self)
 
     def substep(self, f):
         # from genesis.utils.tools import create_timer
@@ -1039,7 +1155,7 @@ class RigidSolver(KinematicSolver):
             self.entities_info,
             self._rigid_global_info,
             self._static_rigid_sim_config,
-            self.constraint_solver.contact_island.contact_island_state,
+            self.constraint_solver.island_state,
             self._is_forward_pos_updated,
             self._is_forward_vel_updated,
             self._is_backward,
@@ -1068,7 +1184,7 @@ class RigidSolver(KinematicSolver):
                 self.collider._collider_state,
                 self._rigid_global_info,
                 self._static_rigid_sim_config,
-                self.constraint_solver.contact_island.contact_island_state,
+                self.constraint_solver.island_state,
                 self._is_backward,
                 self._errno,
             )
@@ -1101,10 +1217,16 @@ class RigidSolver(KinematicSolver):
                 f"Please increase the value of RigidSolver's option 'multiplier_collision_broad_phase'."
             )
         if errno & array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS:
-            max_contact_pairs = self.collider._collider_info.max_contact_pairs[None]
+            max_candidate_contacts = self.collider._collider_info.max_candidate_contacts[None]
             gs.raise_exception(
-                f"Exceeding max number of contact pairs ({max_contact_pairs}). Please increase the value of "
-                "RigidSolver's option 'max_collision_pairs'."
+                f"Exceeding max number of candidate contact points ({max_candidate_contacts}). Please increase the "
+                "value of RigidSolver's option 'max_collision_pairs'."
+            )
+        if errno & array_class.ErrorCode.OVERFLOW_CONTACTS:
+            max_contacts = self.collider._collider_info.max_contacts[None]
+            gs.raise_exception(
+                f"Exceeding max number of post-pruning contact points ({max_contacts}) supported by the constraint "
+                "solver. Please increase the value of RigidSolver's option 'max_contacts'."
             )
         if errno & array_class.ErrorCode.INVALID_FORCE_NAN:
             gs.raise_exception("Invalid constraint forces causing 'nan'. Please decrease Rigid simulation timestep.")
@@ -1130,20 +1252,28 @@ class RigidSolver(KinematicSolver):
 
     def _func_constraint_force(self):
         if not self._disable_constraint:
-            if self._use_contact_island:
-                self.constraint_solver.clear()
-            else:
-                self.constraint_solver.add_equality_constraints()
+            self.constraint_solver.add_equality_constraints()
 
         if self._enable_collision:
             self.collider.detection()
+            # A collision against a sleeping body must wake it before the solve, so it joins the island partition
+            # and responds dynamically this step instead of letting the awake body pass through.
+            if self._use_hibernation:
+                kernel_wake_up_entities_on_new_contact(
+                    self.collider._collider_state,
+                    self.links_info,
+                    self.links_state,
+                    self.entities_state,
+                    self.entities_info,
+                    self.dofs_state,
+                    self.geoms_state,
+                    self._rigid_global_info,
+                    self.constraint_solver.island_state,
+                    self._static_rigid_sim_config,
+                )
 
         if not self._disable_constraint:
-            if self._use_contact_island:
-                self.constraint_solver.add_constraints()
-            else:
-                self.constraint_solver.add_inequality_constraints()
-
+            self.constraint_solver.add_inequality_constraints()
             self.constraint_solver.resolve(self.entities_info, self._rigid_global_info)
 
     def _func_forward_dynamics(self):
@@ -1158,7 +1288,7 @@ class RigidSolver(KinematicSolver):
             self.geoms_state,
             self._rigid_global_info,
             self._static_rigid_sim_config,
-            self.constraint_solver.contact_island.contact_island_state,
+            self.constraint_solver.island_state,
         )
 
     def _func_update_acc(self):
@@ -1250,6 +1380,22 @@ class RigidSolver(KinematicSolver):
             raise ValueError("'local=True' not compatible with ref='root_com'.")
         ref_idx = self._convert_ref_to_idx(ref)
 
+        # A force on a sleeping body must revive it, otherwise the input is silently dropped.
+        if self._use_hibernation:
+            kernel_wake_up_entities_by_links(
+                links_idx,
+                envs_idx,
+                links_info=self.links_info,
+                links_state=self.links_state,
+                entities_state=self.entities_state,
+                entities_info=self.entities_info,
+                dofs_state=self.dofs_state,
+                geoms_state=self.geoms_state,
+                rigid_global_info=self._rigid_global_info,
+                island_state=self.constraint_solver.island_state,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
+
         kernel_apply_links_external_force(
             force, links_idx, envs_idx, ref_idx, 1 if local else 0, self.links_state, self._static_rigid_sim_config
         )
@@ -1292,6 +1438,22 @@ class RigidSolver(KinematicSolver):
         if ref == "root_com" and local:
             raise ValueError("'local=True' not compatible with ref='root_com'.")
         ref_idx = self._convert_ref_to_idx(ref)
+
+        # A torque on a sleeping body must revive it, otherwise the input is silently dropped.
+        if self._use_hibernation:
+            kernel_wake_up_entities_by_links(
+                links_idx,
+                envs_idx,
+                links_info=self.links_info,
+                links_state=self.links_state,
+                entities_state=self.entities_state,
+                entities_info=self.entities_info,
+                dofs_state=self.dofs_state,
+                geoms_state=self.geoms_state,
+                rigid_global_info=self._rigid_global_info,
+                island_state=self.constraint_solver.island_state,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
 
         kernel_apply_links_external_torque(
             torque, links_idx, envs_idx, ref_idx, 1 if local else 0, self.links_state, self._static_rigid_sim_config
@@ -1418,7 +1580,7 @@ class RigidSolver(KinematicSolver):
             collider_state=self.collider._collider_state,
             rigid_global_info=self._rigid_global_info,
             static_rigid_sim_config=self._static_rigid_sim_config,
-            contact_island_state=self.constraint_solver.contact_island.contact_island_state,
+            island_state=self.constraint_solver.island_state,
             is_backward=True,
             errno=self._errno,
         )
@@ -1457,7 +1619,7 @@ class RigidSolver(KinematicSolver):
             geoms_state=self.geoms_state,
             rigid_global_info=self._rigid_global_info,
             static_rigid_sim_config=self._static_rigid_sim_config,
-            contact_island_state=self.constraint_solver.contact_island.contact_island_state,
+            island_state=self.constraint_solver.island_state,
             is_backward=True,
         )
 
@@ -1520,7 +1682,7 @@ class RigidSolver(KinematicSolver):
                 collider_state=self.collider._collider_state,
                 rigid_global_info=self._rigid_global_info,
                 static_rigid_sim_config=self._static_rigid_sim_config,
-                contact_island_state=self.constraint_solver.contact_island.contact_island_state,
+                island_state=self.constraint_solver.island_state,
                 is_backward=self._is_backward,
                 errno=self._errno,
             )
@@ -1757,14 +1919,26 @@ class RigidSolver(KinematicSolver):
         if links_idx is None:
             links_idx = self._base_links_idx
 
-        # Zero-copy fast path: single base link, bool mask, non-relative
-        if (
-            gs.use_zerocopy
-            and not relative
-            and isinstance(links_idx, int)
-            and isinstance(envs_idx, torch.Tensor)
-            and envs_idx.dtype == torch.bool
-        ):
+        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
+        if relative and self._links_offset_pos is None:
+            relative = False
+
+        # Map a single base link's user position to world here (keeping the current orientation) so the zero-copy
+        # in-place write below still applies, both for an environment-uniform and a per-environment offset. Multi-link
+        # relative sets are composed in the kernel branch instead.
+        if relative and isinstance(links_idx, int):
+            cur_quat = self.get_links_quat(links_idx, envs_idx, relative=False)[..., 0, :]
+            offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)[..., 0, :]
+            offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)[..., 0, :]
+            pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device) + _offset_world_shift(
+                offset_pos, offset_quat, cur_quat
+            )
+            relative = False
+
+        # Zero-copy fast path: single base link, non-relative. Write the position buffer in place instead of
+        # launching a kernel. The kernel path below handles relative or multi-link updates, as well as waking up
+        # hibernated entities, which is required whenever hibernation is enabled.
+        if gs.use_zerocopy and not relative and isinstance(links_idx, int) and not self._use_hibernation:
             link = self.links[links_idx]
             if link.is_fixed:
                 data = qd_to_torch(self.links_state.pos, transpose=True, copy=False)
@@ -1772,8 +1946,32 @@ class RigidSolver(KinematicSolver):
             else:
                 data = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start : link.q_start + 3]
-            pos = broadcast_tensor(pos, gs.tc_float, target.shape)
-            torch.where(envs_idx[:, None], pos, target, out=target)
+            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                if pos.ndim == 2 and len(pos) not in (1, len(target)):
+                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal
+                    # mis-scatters a stride-0 broadcast mask, so it must be materialized to a dense mask there.
+                    envs_mask = envs_idx[:, None]
+                    if gs.backend == gs.metal:
+                        envs_mask = envs_mask.expand_as(target).contiguous()
+                    target.masked_scatter_(envs_mask, pos.view_as(pos))
+                else:
+                    pos = broadcast_tensor(pos, gs.tc_float, target.shape)
+                    torch.where(envs_idx[:, None], pos, target, out=target)
+            else:
+                # Fixed links with at least one geom and non-batched vertices cannot take env-specific positions
+                if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
+                    pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device)
+                    same_pos = pos.ndim < 2 or len(pos) == 1 or (torch.diff(pos, dim=0).abs() < gs.EPS).all()
+                    set_all_envs = envs_idx is None or torch.equal(
+                        torch.sort(self._scene._sanitize_envs_idx(envs_idx)).values, self._scene._envs_idx
+                    )
+                    if not (set_all_envs and same_pos):
+                        gs.raise_exception(
+                            "Specifying env-specific pos for fixed links with at least one geometry requires "
+                            "setting morph option 'batch_fixed_verts=True'."
+                        )
+                mask = (0,) if self.n_envs == 0 else indices_to_mask(envs_idx)
+                assign_indexed_tensor(target, mask, pos)
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
         else:
@@ -1782,6 +1980,15 @@ class RigidSolver(KinematicSolver):
             )
             if self.n_envs == 0:
                 pos = pos[None]
+
+            if relative:
+                # Compose the body-frame offset onto the user position, keeping the current orientation, then set the
+                # resulting world position absolutely.
+                cur_quat = qd_to_torch(self.links_state.quat, envs_idx, links_idx, transpose=True, copy=True)
+                offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
+                offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
+                pos = pos + _offset_world_shift(offset_pos, offset_quat, cur_quat)
+                relative = False
 
             # Raise exception for fixed links with at least one geom and non-batched fixed vertices, except if setting
             # same location for all envs at once
@@ -1797,7 +2004,7 @@ class RigidSolver(KinematicSolver):
                 )
 
             # Wake up hibernated entities before setting position (fixed links don't need wake-up)
-            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
                 kernel_wake_up_entities_by_links(
                     links_idx,
                     envs_idx,
@@ -1808,11 +2015,11 @@ class RigidSolver(KinematicSolver):
                     dofs_state=self.dofs_state,
                     geoms_state=self.geoms_state,
                     rigid_global_info=self._rigid_global_info,
+                    island_state=self.constraint_solver.island_state,
                     static_rigid_sim_config=self._static_rigid_sim_config,
                 )
 
             kernel_set_links_pos(
-                relative,
                 pos,
                 links_idx,
                 envs_idx,
@@ -1857,14 +2064,27 @@ class RigidSolver(KinematicSolver):
         if links_idx is None:
             links_idx = self._base_links_idx
 
-        # Zero-copy fast path: single base link, bool mask, non-relative
-        if (
-            gs.use_zerocopy
-            and not relative
-            and isinstance(links_idx, int)
-            and isinstance(envs_idx, torch.Tensor)
-            and envs_idx.dtype == torch.bool
-        ):
+        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
+        if relative and self._links_offset_quat is None:
+            relative = False
+
+        # Computed once and reused by the int fast path and the kernel branch below.
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        relative_pos_passthrough = relative and self._links_offset_pos_is_identity[idx].all()
+
+        # Compose a single base link's user orientation to world here so the zero-copy in-place write below still
+        # applies, both for an environment-uniform and a per-environment offset. This only preserves the user-frame
+        # position when the offset position is identity; a non-zero offset position rotates with the orientation and
+        # is handled (together with multi-link relative sets) in the kernel branch instead.
+        if isinstance(links_idx, int) and relative_pos_passthrough:
+            offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)[..., 0, :]
+            quat = gu.transform_quat_by_quat(offset_quat, torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device))
+            relative = False
+
+        # Zero-copy fast path: single base link, non-relative. Write the quaternion buffer in place instead of
+        # launching a kernel. The kernel path below handles relative or multi-link updates, as well as waking up
+        # hibernated entities, which is required whenever hibernation is enabled.
+        if gs.use_zerocopy and not relative and isinstance(links_idx, int) and not self._use_hibernation:
             link = self.links[links_idx]
             if link.is_fixed:
                 data = qd_to_torch(self.links_state.quat, transpose=True, copy=False)
@@ -1872,8 +2092,31 @@ class RigidSolver(KinematicSolver):
             else:
                 data = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start + 3 : link.q_start + 7]
-            quat = broadcast_tensor(quat, gs.tc_float, target.shape)
-            torch.where(envs_idx[:, None], quat, target, out=target)
+            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                if quat.ndim == 2 and len(quat) not in (1, len(target)):
+                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal
+                    # mis-scatters a stride-0 broadcast mask, so it must be materialized to a dense mask there.
+                    envs_mask = envs_idx[:, None]
+                    if gs.backend == gs.metal:
+                        envs_mask = envs_mask.expand_as(target).contiguous()
+                    target.masked_scatter_(envs_mask, quat.view_as(quat))
+                else:
+                    quat = broadcast_tensor(quat, gs.tc_float, target.shape)
+                    torch.where(envs_idx[:, None], quat, target, out=target)
+            else:
+                # Fixed links with at least one geom and non-batched vertices cannot take env-specific orientations
+                if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
+                    quat = torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device)
+                    same_quat = quat.ndim < 2 or len(quat) == 1 or (torch.diff(quat, dim=0).abs() < gs.EPS).all()
+                    set_all_envs = envs_idx is None or torch.equal(
+                        torch.sort(self._scene._sanitize_envs_idx(envs_idx)).values, self._scene._envs_idx
+                    )
+                    if not (set_all_envs and same_quat):
+                        gs.raise_exception(
+                            "Impossible to set env-specific quat for fixed links with at least one geometry."
+                        )
+                mask = (0,) if self.n_envs == 0 else indices_to_mask(envs_idx)
+                assign_indexed_tensor(target, mask, quat)
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
         else:
@@ -1882,6 +2125,29 @@ class RigidSolver(KinematicSolver):
             )
             if self.n_envs == 0:
                 quat = quat[None]
+
+            if relative:
+                offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
+                if not relative_pos_passthrough:
+                    # The offset position rotates with the orientation, so keep the user-frame position fixed by
+                    # rewriting the world position from the current user position and the new user orientation.
+                    cur_pos = qd_to_torch(self.links_state.pos, envs_idx, links_idx, transpose=True, copy=True)
+                    cur_quat = qd_to_torch(self.links_state.quat, envs_idx, links_idx, transpose=True, copy=True)
+                    offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
+                    user_pos = cur_pos - _offset_world_shift(offset_pos, offset_quat, cur_quat)
+                    world_pos = user_pos + gu.transform_by_quat(offset_pos, quat)
+                    kernel_set_links_pos(
+                        world_pos,
+                        links_idx,
+                        envs_idx,
+                        links_info=self.links_info,
+                        links_state=self.links_state,
+                        rigid_global_info=self._rigid_global_info,
+                        static_rigid_sim_config=self._static_rigid_sim_config,
+                    )
+                # Compose the offset onto the user orientation, then set the resulting world orientation absolutely.
+                quat = gu.transform_quat_by_quat(offset_quat, quat)
+                relative = False
 
             set_all_envs = torch.equal(torch.sort(envs_idx).values, self._scene._envs_idx)
             has_fixed_verts = any(
@@ -1892,7 +2158,7 @@ class RigidSolver(KinematicSolver):
                 gs.raise_exception("Impossible to set env-specific quat for fixed links with at least one geometry.")
 
             # Wake up hibernated entities before setting quaternion (fixed links don't need wake-up)
-            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
                 kernel_wake_up_entities_by_links(
                     links_idx,
                     envs_idx,
@@ -1903,11 +2169,11 @@ class RigidSolver(KinematicSolver):
                     dofs_state=self.dofs_state,
                     geoms_state=self.geoms_state,
                     rigid_global_info=self._rigid_global_info,
+                    island_state=self.constraint_solver.island_state,
                     static_rigid_sim_config=self._static_rigid_sim_config,
                 )
 
             kernel_set_links_quat(
-                relative,
                 quat,
                 links_idx,
                 envs_idx,
@@ -2038,9 +2304,13 @@ class RigidSolver(KinematicSolver):
                 and envs_idx.dtype == torch.bool
             ):
                 qs_data = data[(slice(None), *qs_mask)]
-                if qpos.ndim == 2 and len(qpos) != len(qs_data):
-                    # Note that it is necessary to create a new temporary view because it will be reshaped in-place
-                    qs_data.masked_scatter_(envs_idx[:, None], qpos.view_as(qpos))
+                if qpos.ndim == 2 and len(qpos) not in (1, len(qs_data)):
+                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal mis-scatters
+                    # a stride-0 broadcast mask, so it must be materialized to a dense full-shape mask there.
+                    envs_mask = envs_idx[:, None]
+                    if gs.backend == gs.metal:
+                        envs_mask = envs_mask.expand_as(qs_data).contiguous()
+                    qs_data.masked_scatter_(envs_mask, qpos.view_as(qpos))
                 else:
                     qpos = broadcast_tensor(qpos, gs.tc_float, qs_data.shape)
                     torch.where(envs_idx[:, None], qpos, qs_data, out=qs_data)
@@ -2059,6 +2329,23 @@ class RigidSolver(KinematicSolver):
             )
             if self.n_envs == 0:
                 qpos = qpos[None]
+
+            # Teleporting a sleeping body must revive it, otherwise the new pose is silently dropped.
+            if self._use_hibernation:
+                kernel_wake_up_entities_by_qs(
+                    qs_idx,
+                    envs_idx,
+                    links_info=self.links_info,
+                    links_state=self.links_state,
+                    entities_state=self.entities_state,
+                    entities_info=self.entities_info,
+                    dofs_state=self.dofs_state,
+                    geoms_state=self.geoms_state,
+                    rigid_global_info=self._rigid_global_info,
+                    island_state=self.constraint_solver.island_state,
+                    static_rigid_sim_config=self._static_rigid_sim_config,
+                )
+
             kernel_set_qpos(qpos, qs_idx, envs_idx, self._rigid_global_info, self._static_rigid_sim_config)
             kernel_set_zero(envs_idx, self._errno)
 
@@ -2285,6 +2572,9 @@ class RigidSolver(KinematicSolver):
         )
         if self.n_envs == 0:
             position = position[None]
+
+        self._wake_dofs(dofs_idx, envs_idx)
+
         kernel_set_dofs_position(
             position,
             dofs_idx,
@@ -2322,8 +2612,36 @@ class RigidSolver(KinematicSolver):
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
 
+    def _wake_dofs(self, dofs_idx, envs_idx):
+        # Revive any hibernated entity owning these (already sanitized) dofs before an input is written to or
+        # targeted at them; forward dynamics and integration act only on awake dofs, so an input applied to a
+        # sleeping body would otherwise be silently dropped until it is woken by some other means.
+        if self._use_hibernation:
+            kernel_wake_up_entities_by_dofs(
+                dofs_idx,
+                envs_idx,
+                links_info=self.links_info,
+                links_state=self.links_state,
+                entities_state=self.entities_state,
+                entities_info=self.entities_info,
+                dofs_state=self.dofs_state,
+                geoms_state=self.geoms_state,
+                rigid_global_info=self._rigid_global_info,
+                island_state=self.constraint_solver.island_state,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
+
+    def set_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None, *, skip_forward=False):
+        # Wake the owning entities before delegating to the base setter, which re-sanitizes and applies the write.
+        if self._use_hibernation:
+            _, wake_dofs_idx, wake_envs_idx = self._sanitize_io_variables(
+                velocity, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
+            )
+            self._wake_dofs(wake_dofs_idx, wake_envs_idx)
+        super().set_dofs_velocity(velocity, dofs_idx, envs_idx, skip_forward=skip_forward)
+
     def control_dofs_force(self, force, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and not self._use_hibernation:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dofs_state.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.FORCE
@@ -2339,10 +2657,11 @@ class RigidSolver(KinematicSolver):
         if self.n_envs == 0:
             force = force[None]
 
+        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_force(force, dofs_idx, envs_idx, self.dofs_state, self._static_rigid_sim_config)
 
     def control_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and not self._use_hibernation:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dofs_state.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.VELOCITY
@@ -2360,10 +2679,11 @@ class RigidSolver(KinematicSolver):
         if self.n_envs == 0:
             velocity = velocity[None]
 
+        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_velocity(velocity, dofs_idx, envs_idx, self.dofs_state, self._static_rigid_sim_config)
 
     def control_dofs_position(self, position, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and not self._use_hibernation:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dofs_state.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.POSITION
@@ -2381,10 +2701,11 @@ class RigidSolver(KinematicSolver):
         if self.n_envs == 0:
             position = position[None]
 
+        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_position(position, dofs_idx, envs_idx, self.dofs_state, self._static_rigid_sim_config)
 
     def control_dofs_position_velocity(self, position, velocity, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and not self._use_hibernation:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dofs_state.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.POSITION
@@ -2406,6 +2727,7 @@ class RigidSolver(KinematicSolver):
             position = position[None]
             velocity = velocity[None]
 
+        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_position_velocity(
             position, velocity, dofs_idx, envs_idx, self.dofs_state, self._static_rigid_sim_config
         )
@@ -2445,7 +2767,12 @@ class RigidSolver(KinematicSolver):
             gs.raise_exception("'ref' must be either 'link_origin', 'link_com', or 'root_com'.")
 
     def get_links_pos(
-        self, links_idx=None, envs_idx=None, *, ref: Literal["link_origin", "link_com", "root_com"] = "link_origin"
+        self,
+        links_idx=None,
+        envs_idx=None,
+        *,
+        ref: Literal["link_origin", "link_com", "root_com"] = "link_origin",
+        relative=False,
     ):
         if not gs.use_zerocopy:
             _, links_idx, envs_idx = self._sanitize_io_variables(
@@ -2463,6 +2790,13 @@ class RigidSolver(KinematicSolver):
             tensor = qd_to_torch(self.links_state.pos, envs_idx, links_idx, transpose=True, copy=True)
         else:
             gs.raise_exception("'ref' must be either 'link_origin', 'link_com', or 'root_com'.")
+
+        # The pose offset is defined on the link origin, so it is only stripped for the 'link_origin' reference.
+        if relative and ref_idx == 2 and self._links_offset_pos is not None:
+            quat = qd_to_torch(self.links_state.quat, envs_idx, links_idx, transpose=True, copy=True)
+            offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
+            offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
+            tensor -= _offset_world_shift(offset_pos, offset_quat, quat)
 
         return tensor[0] if self.n_envs == 0 else tensor
 
@@ -2539,12 +2873,20 @@ class RigidSolver(KinematicSolver):
         tensor = qd_to_torch(self.geoms_state.friction_ratio, envs_idx, geoms_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
-    def get_geoms_pos(self, geoms_idx=None, envs_idx=None):
+    def get_geoms_pos(self, geoms_idx=None, envs_idx=None, *, relative=False):
         tensor = qd_to_torch(self.geoms_state.pos, envs_idx, geoms_idx, transpose=True, copy=True)
+        if relative and self._geoms_offset_pos is not None:
+            quat = qd_to_torch(self.geoms_state.quat, envs_idx, geoms_idx, transpose=True, copy=True)
+            offset_pos = self._geoms_offset_pos if geoms_idx is None else self._geoms_offset_pos[geoms_idx]
+            offset_quat = self._geoms_offset_quat if geoms_idx is None else self._geoms_offset_quat[geoms_idx]
+            tensor -= _offset_world_shift(offset_pos, offset_quat, quat)
         return tensor[0] if self.n_envs == 0 else tensor
 
-    def get_geoms_quat(self, geoms_idx=None, envs_idx=None):
+    def get_geoms_quat(self, geoms_idx=None, envs_idx=None, *, relative=False):
         tensor = qd_to_torch(self.geoms_state.quat, envs_idx, geoms_idx, transpose=True, copy=True)
+        if relative and self._geoms_offset_quat is not None:
+            offset_quat = self._geoms_offset_quat if geoms_idx is None else self._geoms_offset_quat[geoms_idx]
+            tensor = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), tensor)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_dofs_control_force(self, dofs_idx=None, envs_idx=None):
@@ -2854,7 +3196,7 @@ def kernel_step_1(
     entities_info: array_class.EntitiesInfo,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
     is_forward_pos_updated: qd.template(),
     is_forward_vel_updated: qd.template(),
     is_backward: qd.template(),
@@ -2899,7 +3241,7 @@ def kernel_step_1(
         geoms_state=geoms_state,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
-        contact_island_state=contact_island_state,
+        island_state=island_state,
         is_backward=is_backward,
     )
 
@@ -2919,7 +3261,7 @@ def kernel_step_2(
     collider_state: array_class.ColliderState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    contact_island_state: array_class.ContactIslandState,
+    island_state: array_class.IslandState,
     is_backward: qd.template(),
     errno: qd.Tensor,
 ):
@@ -2963,18 +3305,21 @@ def kernel_step_2(
             dofs_state=dofs_state,
             entities_state=entities_state,
             entities_info=entities_info,
+            links_info=links_info,
             links_state=links_state,
             geoms_state=geoms_state,
             collider_state=collider_state,
             unused__rigid_global_info=rigid_global_info,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
-            contact_island_state=contact_island_state,
+            island_state=island_state,
             errno=errno,
         )
         func_aggregate_awake_entities(
             entities_state=entities_state,
             entities_info=entities_info,
+            links_info=links_info,
+            links_state=links_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
