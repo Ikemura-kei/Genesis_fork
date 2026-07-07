@@ -466,9 +466,11 @@ from .utils.misc import get_src_dir as _get_src_dir
 with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
     try:
         from pygel3d import graph, hmesh
-    except OSError as e:
-        # Import may fail because of missing system dependencies (libGLU.so.1).
-        # This is not blocking because it is only an issue for hybrid entities.
+    except (OSError, ImportError) as e:
+        # Import may fail because of missing system dependencies (libGLU.so.1), or because
+        # pygel3d itself is not installed (no linux-aarch64 wheel — gated out of the deps on
+        # ARM). Non-blocking: it is only used by hybrid entities (skeletonization), and
+        # utils/hybrid.py already raises a clear ImportError on aarch64 if that path runs.
         pass
 
     try:
