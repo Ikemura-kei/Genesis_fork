@@ -1647,6 +1647,7 @@ class LinksState:
     cfrc_applied_vel: qd.Tensor
     cfrc_coupling_ang: qd.Tensor
     cfrc_coupling_vel: qd.Tensor
+    cfrc_coupling_readout_vel: qd.Tensor
     contact_force: qd.Tensor
     is_hibernated: qd.Tensor
     awake_steps: qd.Tensor
@@ -1699,6 +1700,10 @@ def get_links_state(solver):
         cfrc_applied_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cfrc_coupling_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cfrc_coupling_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
+        # Persistent readout of the MPM/soft->rigid coupling force per link (captured each substep
+        # BEFORE cfrc_coupling_vel is cleared in forward dynamics), so it survives to a post-step read.
+        # Used for ACTUAL soft-body gripper-object contact detection (see legacy_coupler / worker).
+        cfrc_coupling_readout_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         contact_force=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         is_hibernated=V(dtype=gs.qd_int, shape=shape),
         awake_steps=V(dtype=gs.qd_int, shape=shape),

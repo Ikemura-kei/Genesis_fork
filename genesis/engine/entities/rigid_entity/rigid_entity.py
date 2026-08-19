@@ -4241,6 +4241,23 @@ class RigidEntity(KinematicEntity):
         tensor = qd_to_torch(self._solver.links_state.contact_force, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self._solver.n_envs == 0 else tensor
 
+    def get_links_net_coupling_force(self, envs_idx=None):
+        """
+        Returns the net MPM/soft->rigid COUPLING force on each of this entity's links (last substep,
+        captured before the per-substep clear). Nonzero only where a soft body is actually pushing on
+        the link — the actual soft-body contact signal, analogous to get_links_net_contact_force for
+        rigid contacts.
+
+        Returns
+        -------
+        entity_links_force : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
+        """
+        links_idx = slice(self.link_start, self.link_end)
+        tensor = qd_to_torch(
+            self._solver.links_state.cfrc_coupling_readout_vel, envs_idx, links_idx, transpose=True, copy=True
+        )
+        return tensor[0] if self._solver.n_envs == 0 else tensor
+
     # ------------------------------------------------------------------------------------
     # ----------------------------------- friction ---------------------------------------
     # ------------------------------------------------------------------------------------

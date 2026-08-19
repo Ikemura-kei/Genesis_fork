@@ -1273,9 +1273,12 @@ def func_update_force(
                         func_add_safe_backward(links_state.cfrc_vel, I_p, links_state.cfrc_vel[i_l, i_b], BW)
                         func_add_safe_backward(links_state.cfrc_ang, I_p, links_state.cfrc_ang[i_l, i_b], BW)
 
-    # Clear coupling forces after use
+    # Clear coupling forces after use. First stash this substep's coupling force into a persistent
+    # readout so it survives to a post-step Python read (used for actual soft-body contact detection);
+    # written every substep, so it reflects the current coupling force (0 when nothing is touching).
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for I in qd.grouped(qd.ndrange(*links_state.cfrc_coupling_ang.shape)):
+        links_state.cfrc_coupling_readout_vel[I] = links_state.cfrc_coupling_vel[I]
         links_state.cfrc_coupling_ang[I] = qd.Vector.zero(gs.qd_float, 3)
         links_state.cfrc_coupling_vel[I] = qd.Vector.zero(gs.qd_float, 3)
 
